@@ -22,7 +22,12 @@ use primitives::{
     node::{Block, BlockHeader, retarget_difficulty},
 };
 
-use crate::{chain::Chain, executor::execute_block, pow};
+use crate::{
+    chain::Chain,
+    evm::BreejaDb,
+    executor::{BlockContext, execute_block},
+    pow,
+};
 
 /// Starts the miner on its own OS thread.
 ///
@@ -51,10 +56,10 @@ fn run(chain: Chain) {
     while !chain.is_shutting_down() {
         // snapshot the chain, holding the read lock only briefly
         let generation = chain.mempool_generation();
-        let (accounts, parent, batch) = {
+        let (db, parent, batch) = {
             let state = chain.read();
             (
-                state.accounts_snapshot(),
+                BreejaDb::from_state(&state),
                 state.head().clone(),
                 state.peek_mempool_batch(),
             )
@@ -63,7 +68,18 @@ fn run(chain: Chain) {
         let number = parent.number + 1;
 
         // execute the candidate block, with no lock held
-        let execution = execute_block(accounts, &batch, number, config.miner);
+        // A block's timestamp must advance, even if the system clock does not. It is
+        // fixed before execution because the EVM can read it (TIMESTAMP opcode).
+        let timestamp = unix_now().max(parent.timestamp + 1);
+        let context = BlockContext {
+            number,
+            timestamp,
+            parent_hash: parent.hash,
+            gas_limit: BLOCK_GAS_LIMIT,
+            difficulty,
+            miner: config.miner,
+        };
+        let execution = execute_block(db, &batch, &context);
 
         let mut header = BlockHeader {
             number,
@@ -72,8 +88,7 @@ fn run(chain: Chain) {
             transaction_root: execution.transaction_root,
             receipts_root: execution.receipts_root,
             difficulty,
-            // A block's timestamp must advance, even if the system clock does not.
-            timestamp: unix_now().max(parent.timestamp + 1),
+            timestamp,
             gas_limit: BLOCK_GAS_LIMIT,
             gas_used: execution.gas_used,
             miner: config.miner,

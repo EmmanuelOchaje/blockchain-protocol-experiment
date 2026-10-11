@@ -132,7 +132,26 @@ write going through `BreejaDb`. It asserts that:
 - REVM itself paid the miner exactly `gas used x gas price` with nothing credited by
   hand (this is Pitfall 1 observed directly), and total supply is unchanged.
 
-## 5. Decisions
+## 5. Milestone 2: transfers through REVM (parity)
+
+**What changed:** `apply_transfer` is gone. `executor::execute_transaction` builds a
+`TxEnv` (legacy call), a `BlockEnv` from a new `BlockContext`, and runs REVM over a
+`BreejaDb`; the resulting state is committed back with `DatabaseCommit`. The miner
+now fixes the block timestamp *before* execution (the `TIMESTAMP` opcode can read
+it), snapshots with `BreejaDb::from_state`, and passes a `BlockContext`.
+
+- Invalid transaction (bad nonce, cannot afford the reservation) -> `Err`, skipped,
+  leaves no trace. A transaction that executes and fails is not skipped (matters
+  from M3; for plain transfers nothing can fail after validation).
+- Receipt `status` comes from the EVM outcome; gas from `tx_gas_used()`.
+- Pitfall canaries as tests: nonce is exactly 1 after one transfer (REVM bumps it,
+  we do not), and the miner holds exactly one fee (REVM pays it, we do not).
+
+**Tests:** 62 pass (was 61). The parity test shows a plain transfer through REVM
+costs exactly 21,000 gas. The supply-conservation canary in `tests/mining.rs` is
+unchanged and passes.
+
+## 6. Decisions
 
 - [x] **Code representation: `code_hash` plus a shared map**, not `Bytecode` on each
       account. Identical contracts are stored once; it matches what REVM's
@@ -149,12 +168,13 @@ write going through `BreejaDb`. It asserts that:
       that differ only by a zeroed slot are identical and will hash identically once
       the state root covers storage.
 - [ ] `eth_call`: keep or disable nonce and balance checks (via `CfgEnv`).
-- [ ] `SpecId`: Shanghai, and the acknowledged "Frontier consensus, Shanghai
-      execution" compromise.
-- [ ] `basefee = 0` and why (pre-EIP-1559; any other value burns ETH).
+- [x] `SpecId`: Shanghai, and the acknowledged "Frontier consensus, Shanghai
+      execution" compromise. `prevrandao` = parent hash (no `mix_hash` field).
+- [x] `basefee = 0`: Breeja has no EIP-1559 burn, so any other value would destroy
+      ETH and break supply conservation.
 - [ ] Estimation safety margin for `eth_estimateGas`.
 
-## 6. What does not work / known limitations
+## 7. What does not work / known limitations
 
 (Write this honestly as you go. Honesty is graded separately and heavily.)
 
@@ -162,7 +182,8 @@ write going through `BreejaDb`. It asserts that:
   is not yet derived from `storage`, and `code_hash` is not yet populated by any
   real transaction. Two chains differing only in contract state would currently
   hash the same. Milestone 6 fixes this.
-- `BreejaDb` is built and tested, but nothing executes through it yet. The miner
-  still uses `apply_transfer` until Milestone 2.
+- Execution now goes through REVM, but the commit still returns only accounts, not
+  new contract code (Milestone 3). `txs=` in the mined log is still attempted, not
+  included.
 - `state_history` still clones every account, now including its storage, on every
   block (see Q4). Code is shared, storage is not.
