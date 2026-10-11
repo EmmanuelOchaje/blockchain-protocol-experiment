@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use alloy::primitives::{Address, B256};
 use primitives::{
     constants::{BLOCK_REWARD, CHAIN_ID},
-    node::{Account, PendingTransaction, Transaction, TransactionReceipt, hash_list_root},
+    node::{
+        Account, PendingTransaction, ReceiptLog, Transaction, TransactionReceipt, hash_list_root,
+    },
 };
 use revm::{
     Context, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext,
@@ -27,6 +29,8 @@ const SPEC: SpecId = SpecId::SHANGHAI;
 pub struct Execution {
     /// Account state after the batch, ready to become the new head state.
     pub accounts: HashMap<Address, Account>,
+    /// The chain-wide code map after the batch, including any new contracts.
+    pub code: HashMap<B256, alloy::primitives::Bytes>,
     pub transactions: Vec<Transaction>,
     pub receipts: Vec<TransactionReceipt>,
     pub gas_used: u64,
@@ -73,12 +77,16 @@ impl BlockContext {
 }
 
 /// What one executed transaction cost and whether it succeeded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxOutcome {
     pub gas_used: u64,
     /// `false` if the transaction ran but reverted or halted. Such a transaction is
     /// still valid, still mined, and the sender still pays for the gas it used.
     pub success: bool,
+    /// Set when a creation succeeded.
+    pub contract_address: Option<Address>,
+    /// Empty unless the transaction succeeded.
+    pub logs: Vec<ReceiptLog>,
 }
 
 /// Runs one transaction through REVM against `db`, committing its effects.
@@ -101,7 +109,11 @@ pub fn execute_transaction(
         caller: tx.from,
         gas_limit: tx.gas,
         gas_price: tx.gas_price,
-        kind: TxKind::Call(tx.to),
+        kind: match tx.to {
+            Some(to) => TxKind::Call(to),
+            None => TxKind::Create,
+        },
+        data: tx.input.clone(),
         value: tx.value,
         nonce: tx.nonce,
         chain_id: Some(tx.chain_id),
@@ -126,9 +138,29 @@ pub fn execute_transaction(
     drop(evm);
     db.commit(state);
 
+    let success = result.is_success();
+    // A reverted or halted call's logs are undone with the rest of its effects, so
+    // the receipt of a failed transaction carries none.
+    let logs = if success {
+        result
+            .logs()
+            .iter()
+            .map(|log| ReceiptLog {
+                address: log.address,
+                topics: log.data.topics().to_vec(),
+                data: log.data.data.clone(),
+                log_index: 0, // numbered block-wide by execute_block
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(TxOutcome {
         gas_used: result.tx_gas_used(),
-        success: result.is_success(),
+        success,
+        contract_address: result.created_address(),
+        logs,
     })
 }
 
@@ -162,10 +194,15 @@ pub fn execute_block(
     let mut transactions = Vec::new();
     let mut receipts = Vec::new();
     let mut gas_used = 0u64;
+    let mut log_count = 0u64;
 
     for tx in batch {
         match execute_transaction(&mut db, block, tx) {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                for log in &mut outcome.logs {
+                    log.log_index = log_count;
+                    log_count += 1;
+                }
                 let index = transactions.len() as u64;
                 gas_used += outcome.gas_used;
 
@@ -183,7 +220,7 @@ pub fn execute_block(
                     nonce: tx.nonce,
                     gas: tx.gas,
                     gas_price: tx.gas_price,
-                    input: Default::default(),
+                    input: tx.input.clone(),
                     v: tx.v,
                     r: tx.r,
                     s: tx.s,
@@ -199,6 +236,8 @@ pub fn execute_block(
                     gas_used: outcome.gas_used,
                     cummulative_gas_used: gas_used,
                     effective_gas_price: tx.gas_price,
+                    contract_address: outcome.contract_address,
+                    logs: outcome.logs,
                     status: outcome.success as u8,
                 });
             }
@@ -222,6 +261,7 @@ pub fn execute_block(
         receipts_root: hash_list_root(&receipt_hashes),
         state_root: primitives::node::state_root_of(&db.accounts),
         accounts: db.accounts,
+        code: db.code,
         transactions,
         receipts,
         gas_used,
@@ -260,7 +300,8 @@ mod tests {
         PendingTransaction {
             hash: B256::repeat_byte(0xab),
             from: DEV_ADDRESS,
-            to: DEV_ADDRESS_1,
+            to: Some(DEV_ADDRESS_1),
+            input: Default::default(),
             value,
             nonce,
             gas: TRANSFER_GAS,
@@ -386,5 +427,124 @@ mod tests {
 
         let execution = execute_block(db, &batch, &block(miner));
         assert_eq!(execution.transactions.len(), 1);
+    }
+
+    // ---- Milestone 3: contracts ----
+
+    const STORE_42_INIT: [u8; 23] =
+        alloy::hex!("600b600c600039600b6000f3602a60005560006000a000");
+    const ALWAYS_REVERTS_INIT: [u8; 17] = alloy::hex!("6005600c60003960056000f360006000fd");
+
+    fn create(init: &[u8], nonce: u64, tag: u8) -> PendingTransaction {
+        PendingTransaction {
+            hash: B256::repeat_byte(tag),
+            to: None,
+            input: init.to_vec().into(),
+            gas: 200_000,
+            ..transfer(U256::ZERO, nonce)
+        }
+    }
+
+    fn call(to: Address, nonce: u64, gas: u64, tag: u8) -> PendingTransaction {
+        PendingTransaction {
+            hash: B256::repeat_byte(tag),
+            to: Some(to),
+            gas,
+            ..transfer(U256::ZERO, nonce)
+        }
+    }
+
+    #[test]
+    fn a_deployment_yields_a_contract_address_code_and_a_receipt() {
+        let miner = Address::repeat_byte(0x99);
+        let db = funded(one_eth() * U256::from(10u64));
+        let execution = execute_block(db, &[create(&STORE_42_INIT, 0, 1)], &block(miner));
+
+        let receipt = &execution.receipts[0];
+        let contract = DEV_ADDRESS.create(0);
+        assert_eq!(receipt.status, 1);
+        assert_eq!(receipt.to, None);
+        assert_eq!(receipt.contract_address, Some(contract));
+        assert_eq!(receipt.gas_used, 55_522); // the brief's figure on REVM 43
+
+        // The runtime code (not the init code) is stored under its hash.
+        let runtime = alloy::hex!("602a60005560006000a000");
+        let hash = alloy::primitives::keccak256(runtime);
+        assert_eq!(execution.accounts[&contract].code_hash, hash);
+        assert_eq!(execution.code[&hash].as_ref(), runtime);
+        assert_eq!(execution.transactions[0].input.as_ref(), STORE_42_INIT);
+    }
+
+    #[test]
+    fn calling_a_contract_writes_storage_and_emits_a_log() {
+        let miner = Address::repeat_byte(0x99);
+        let db = funded(one_eth() * U256::from(10u64));
+        let contract = DEV_ADDRESS.create(0);
+        let batch = [
+            create(&STORE_42_INIT, 0, 1),
+            call(contract, 1, 100_000, 2),
+        ];
+        let execution = execute_block(db, &batch, &block(miner));
+
+        let receipt = &execution.receipts[1];
+        assert_eq!(receipt.status, 1);
+        assert_eq!(receipt.gas_used, 43_487);
+        assert_eq!(receipt.logs.len(), 1);
+        assert_eq!(receipt.logs[0].address, contract);
+        assert_eq!(execution.accounts[&contract].storage[&U256::ZERO], U256::from(42));
+        // Gas accumulates across the block.
+        assert_eq!(receipt.cummulative_gas_used, 55_522 + 43_487);
+    }
+
+    #[test]
+    fn a_reverting_call_is_mined_charged_and_marked_failed() {
+        let miner = Address::repeat_byte(0x99);
+        let db = funded(one_eth() * U256::from(10u64));
+        let contract = DEV_ADDRESS.create(0);
+        let batch = [
+            create(&ALWAYS_REVERTS_INIT, 0, 1),
+            call(contract, 1, 100_000, 2),
+        ];
+        let execution = execute_block(db, &batch, &block(miner));
+
+        // Included, not skipped (this is Part 0 Q2).
+        assert_eq!(execution.transactions.len(), 2);
+        let receipt = &execution.receipts[1];
+        assert_eq!(receipt.status, 0);
+        assert!(receipt.gas_used >= TRANSFER_GAS);
+        assert!(receipt.logs.is_empty());
+        // The sender paid for it and the nonce advanced.
+        assert_eq!(execution.accounts[&DEV_ADDRESS].nonce, 2);
+    }
+
+    #[test]
+    fn running_out_of_gas_burns_the_whole_limit_but_is_still_mined() {
+        let miner = Address::repeat_byte(0x99);
+        let db = funded(one_eth() * U256::from(10u64));
+        let contract = DEV_ADDRESS.create(0);
+        // Enough for the 21,000 intrinsic cost, not for the SSTORE.
+        let batch = [create(&STORE_42_INIT, 0, 1), call(contract, 1, 30_000, 2)];
+        let execution = execute_block(db, &batch, &block(miner));
+
+        let receipt = &execution.receipts[1];
+        assert_eq!(receipt.status, 0);
+        assert_eq!(receipt.gas_used, 30_000);
+        assert!(!execution.accounts[&contract].storage.contains_key(&U256::ZERO));
+    }
+
+    #[test]
+    fn contract_execution_neither_creates_nor_destroys_eth() {
+        let miner = Address::repeat_byte(0x99);
+        let start = one_eth() * U256::from(10u64);
+        let db = funded(start);
+        let contract = DEV_ADDRESS.create(0);
+        let batch = [
+            create(&STORE_42_INIT, 0, 1),
+            call(contract, 1, 100_000, 2),
+            call(contract, 2, 30_000, 3),
+        ];
+        let execution = execute_block(db, &batch, &block(miner));
+        let total: U256 = execution.accounts.values().map(|a| a.balance).sum();
+        assert_eq!(total, start + BLOCK_REWARD);
     }
 }

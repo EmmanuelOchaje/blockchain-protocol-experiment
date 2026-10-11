@@ -126,8 +126,7 @@ pub struct BlockHeader {
 
 /// A transaction that has been included in a block.
 ///
-/// `input` is always empty: Breeja rejects anything with calldata, because it
-/// has no EVM to run it with.
+/// `to` is `None` for a contract creation, and `input` is then the init code.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transaction {
@@ -137,7 +136,7 @@ pub struct Transaction {
     pub transaction_index: u64,
     pub chain_id: u64,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
     pub value: U256,
     pub nonce: u64,
     pub gas: u64,
@@ -157,13 +156,28 @@ pub struct TransactionReceipt {
     pub block_hash: B256,
     pub block_number: u64,
     pub from: Address,
-    pub to: Address,
+    pub to: Option<Address>,
     pub gas_used: u64,
     pub cummulative_gas_used: u64,
     pub effective_gas_price: u128,
-    /// `1` for success. Breeja only ever includes transactions it has already
-    /// validated, so a receipt is never a failure.
+    /// The address a successful contract creation produced.
+    pub contract_address: Option<Address>,
+    /// Logs the transaction emitted. Empty if it reverted or halted, because a
+    /// failed call's logs are rolled back with the rest of its effects.
+    pub logs: Vec<ReceiptLog>,
+    /// `1` for success, `0` if the transaction ran but reverted or halted.
     pub status: u8,
+}
+
+/// One event emitted by a `LOG0`..`LOG4` opcode.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptLog {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: Bytes,
+    /// Position among all logs in the block (not just this transaction's).
+    pub log_index: u64,
 }
 
 /// A transaction that has been accepted into the mempool but not yet mined.
@@ -171,8 +185,11 @@ pub struct TransactionReceipt {
 pub struct PendingTransaction {
     pub hash: B256,
     pub from: Address,
-    pub to: Address,
+    /// `None` for a contract creation.
+    pub to: Option<Address>,
     pub value: U256,
+    /// Calldata, or init code for a creation.
+    pub input: Bytes,
     pub nonce: u64,
     pub gas: u64,
     pub gas_price: u128,
@@ -180,6 +197,18 @@ pub struct PendingTransaction {
     pub v: u64,
     pub r: U256,
     pub s: U256,
+}
+
+/// Gas a transaction costs before a single opcode runs: 21,000, plus 4 per zero
+/// byte and 16 per non-zero byte of calldata, plus for a creation 32,000 and
+/// 2 per 32-byte word of init code (EIP-3860, in force under Shanghai).
+pub fn intrinsic_gas(input: &[u8], is_create: bool) -> u64 {
+    let calldata: u64 = input.iter().map(|b| if *b == 0 { 4 } else { 16 }).sum();
+    let mut gas = TRANSFER_GAS + calldata;
+    if is_create {
+        gas += 32_000 + 2 * (input.len() as u64).div_ceil(32);
+    }
+    gas
 }
 
 /// The accounts a chain starts with, before any block has been mined.
@@ -593,6 +622,7 @@ impl BlockState {
     pub fn commit_block(
         &mut self,
         accounts: HashMap<Address, Account>,
+        code: HashMap<B256, Bytes>,
         block: Block,
         transactions: Vec<Transaction>,
         receipts: Vec<TransactionReceipt>,
@@ -602,6 +632,8 @@ impl BlockState {
             .retain(|pending| !mined.contains(&pending.hash));
 
         self.accounts = accounts;
+        // Code is immutable and content-addressed, so merging is just extending.
+        self.code.extend(code);
         self.block_index.insert(block.hash, block.number);
         for tx in transactions {
             self.transactions.insert(tx.hash, tx);
@@ -721,7 +753,8 @@ mod tests {
         state.add_to_mempool(PendingTransaction {
             hash: B256::repeat_byte(0xaa),
             from: sender,
-            to: Address::repeat_byte(0x22),
+            to: Some(Address::repeat_byte(0x22)),
+            input: Bytes::new(),
             value: one_eth,
             nonce: 0,
             gas: TRANSFER_GAS,
@@ -791,7 +824,7 @@ mod tests {
             hash: B256::repeat_byte(0x01),
             ..Default::default()
         };
-        state.commit_block(accounts, block, vec![], vec![]);
+        state.commit_block(accounts, HashMap::new(), block, vec![], vec![]);
 
         assert_eq!(state.get_storage(&contract, slot), U256::from(42u64));
         // History answers for each block honestly: zero before, 42 after.

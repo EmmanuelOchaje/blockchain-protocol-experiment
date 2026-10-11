@@ -6,7 +6,8 @@ use alloy::primitives::{Address, B256, U256};
 use node::{
     Chain, ChainConfig, miner,
     testing::{
-        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, one_eth, sign_transfer, sign_transfer_with,
+        DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, one_eth, sign_call, sign_create,
+        sign_transfer, sign_transfer_with,
     },
 };
 use primitives::{
@@ -84,7 +85,7 @@ fn a_signed_transfer_is_mined_and_moves_the_eth() {
     assert_eq!(state.mempool_len(), 0);
     let tx = state.get_transaction(&tx_hash).unwrap();
     assert_eq!(tx.from, alice);
-    assert_eq!(tx.to, bob);
+    assert_eq!(tx.to, Some(bob));
     assert_eq!(tx.value, one_eth() * U256::from(5u64));
 
     // The block it landed in lists it.
@@ -314,4 +315,45 @@ fn a_new_transaction_makes_the_miner_rebuild_its_candidate_block() {
         one_eth(),
         "a transaction submitted while mining was already underway still got mined"
     );
+}
+
+#[test]
+fn a_contract_can_be_deployed_called_and_failed_calls_are_still_mined() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let chain = test_chain(&[(alice, one_eth() * U256::from(100u64))]);
+
+    let store_42 = alloy::hex!("600b600c600039600b6000f3602a60005560006000a000");
+    let deploy = sign_create(DEV_PRIVATE_KEY, store_42.to_vec().into(), 0, 200_000).unwrap();
+    let call = sign_call(DEV_PRIVATE_KEY, alice.create(0), Default::default(), 1, 100_000).unwrap();
+    // Valid, but the gas limit covers only the intrinsic cost: it runs out of gas.
+    let starved = sign_call(DEV_PRIVATE_KEY, alice.create(0), Default::default(), 2, 21_500).unwrap();
+
+    let deploy_hash = chain.submit_raw_transaction(&deploy).unwrap();
+    let call_hash = chain.submit_raw_transaction(&call).unwrap();
+    let starved_hash = chain.submit_raw_transaction(&starved).unwrap();
+
+    let handle = miner::spawn(chain.clone());
+    wait_for(Duration::from_secs(10), "all three to be mined", || {
+        chain.read().get_receipt(&starved_hash).is_some()
+    });
+    chain.shutdown();
+    handle.join().unwrap();
+
+    let state = chain.read();
+    let contract = alice.create(0);
+
+    let deployed = state.get_receipt(&deploy_hash).unwrap();
+    assert_eq!(deployed.contract_address, Some(contract));
+    assert_eq!(deployed.status, 1);
+    assert_eq!(state.get_code(&contract).len(), 11);
+
+    let called = state.get_receipt(&call_hash).unwrap();
+    assert_eq!(called.status, 1);
+    assert_eq!(called.logs.len(), 1);
+    assert_eq!(state.get_storage(&contract, U256::ZERO), U256::from(42));
+
+    let failed = state.get_receipt(&starved_hash).unwrap();
+    assert_eq!(failed.status, 0);
+    assert_eq!(failed.gas_used, 21_500);
+    assert_eq!(state.get_account(&alice).nonce, 3);
 }

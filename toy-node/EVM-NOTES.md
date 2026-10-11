@@ -151,7 +151,31 @@ it), snapshots with `BreejaDb::from_state`, and passes a `BlockContext`.
 costs exactly 21,000 gas. The supply-conservation canary in `tests/mining.rs` is
 unchanged and passes.
 
-## 6. Decisions
+## 6. Milestone 3: contracts
+
+**What changed:**
+
+- `to` is `Option<Address>` on `PendingTransaction`, `Transaction` and
+  `TransactionReceipt` (`None` = creation); pending and mined transactions now carry
+  `input`. JSON-RPC returns `to: null` for a creation.
+- `pool.rs`: the three "no EVM" checks are gone (Part 0 Q1). In their place: init
+  code is capped at 49,152 bytes (EIP-3860), and the gas limit must cover
+  `intrinsic_gas` = 21,000 + 4/16 per zero/non-zero calldata byte (+ 32,000 and
+  2 per init-code word for a creation).
+- Receipts are real: `status` 0/1, `contract_address`, `logs` (each with a
+  block-wide `logIndex`). A failed transaction's receipt carries no logs, since a
+  revert undoes them.
+- `execute_transaction` maps `to: None` to `TxKind::Create`; `execute_block` returns
+  the code map and `commit_block` merges it, so deployed code survives the block.
+- Failed-but-valid transactions are included and charged (Part 0 Q2); only invalid
+  ones are skipped.
+
+**Tests:** 70 pass (was 62): deploy (55,522 gas, runtime code stored by hash), call
+(43,487 gas, one log, slot 0 = 42), revert is mined with status 0 and nonce
+advanced, out-of-gas burns the whole limit, ETH conservation across contract
+execution, two pool tests, and a miner end-to-end test (deploy, call, starved call).
+
+## 7. Decisions
 
 - [x] **Code representation: `code_hash` plus a shared map**, not `Bytecode` on each
       account. Identical contracts are stored once; it matches what REVM's
@@ -174,7 +198,7 @@ unchanged and passes.
       ETH and break supply conservation.
 - [ ] Estimation safety margin for `eth_estimateGas`.
 
-## 7. What does not work / known limitations
+## 8. What does not work / known limitations
 
 (Write this honestly as you go. Honesty is graded separately and heavily.)
 
@@ -182,8 +206,13 @@ unchanged and passes.
   is not yet derived from `storage`, and `code_hash` is not yet populated by any
   real transaction. Two chains differing only in contract state would currently
   hash the same. Milestone 6 fixes this.
-- Execution now goes through REVM, but the commit still returns only accounts, not
-  new contract code (Milestone 3). `txs=` in the mined log is still attempted, not
-  included.
+- `txs=` in the mined log is still the number *attempted*, not included.
+- An invalid transaction that `execute_block` skips is not removed from the
+  mempool, so it is retried every block (pre-existing behaviour).
+- Block filling still uses the 149-transaction cap, not gas actually used, so a
+  block of heavy contract calls can exceed `BLOCK_GAS_LIMIT` in total (Milestone 6).
+- `eth_call` / `eth_estimateGas` still refuse calldata (Milestone 4); `eth_getCode`,
+  `eth_getStorageAt`, `eth_getLogs` do not exist yet (Milestone 5); `logsBloom` is
+  still all zeros.
 - `state_history` still clones every account, now including its storage, on every
   block (see Q4). Code is shared, storage is not.

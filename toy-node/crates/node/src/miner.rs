@@ -154,7 +154,7 @@ fn run(chain: Chain) {
                 continue;
             }
             block.transactions = transactions.iter().map(|tx| tx.hash).collect();
-            state.commit_block(execution.accounts, block, transactions, receipts);
+            state.commit_block(execution.accounts, execution.code, block, transactions, receipts);
         }
 
         tracing::info!(

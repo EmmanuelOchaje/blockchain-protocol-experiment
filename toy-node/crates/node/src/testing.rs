@@ -36,17 +36,74 @@ pub fn sign_transfer_with(
     gas_price: u128,
     gas_limit: u64,
 ) -> Result<Bytes, anyhow::Error> {
+    sign_legacy(
+        private_key,
+        TxKind::Call(to),
+        value,
+        nonce,
+        gas_price,
+        gas_limit,
+        Bytes::new(),
+    )
+}
+
+/// Signs a contract creation whose init code is `init_code`.
+pub fn sign_create(
+    private_key: &str,
+    init_code: Bytes,
+    nonce: u64,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
+    sign_legacy(
+        private_key,
+        TxKind::Create,
+        U256::ZERO,
+        nonce,
+        GAS_PRICE,
+        gas_limit,
+        init_code,
+    )
+}
+
+/// Signs a call to a contract with `calldata`.
+pub fn sign_call(
+    private_key: &str,
+    to: Address,
+    calldata: Bytes,
+    nonce: u64,
+    gas_limit: u64,
+) -> Result<Bytes, anyhow::Error> {
+    sign_legacy(
+        private_key,
+        TxKind::Call(to),
+        U256::ZERO,
+        nonce,
+        GAS_PRICE,
+        gas_limit,
+        calldata,
+    )
+}
+
+fn sign_legacy(
+    private_key: &str,
+    kind: TxKind,
+    value: U256,
+    nonce: u64,
+    gas_price: u128,
+    gas_limit: u64,
+    input: Bytes,
+) -> Result<Bytes, anyhow::Error> {
     let signer: PrivateKeySigner = private_key.parse()?;
 
-    // 1. The unsigned transaction. `input` is empty because this node has no EVM.
+    // 1. The unsigned transaction.
     let tx = TxLegacy {
         chain_id: Some(CHAIN_ID),
         nonce,
         gas_price,
         gas_limit,
-        to: TxKind::Call(to),
+        to: kind,
         value,
-        input: Bytes::new(),
+        input,
     };
 
     // 2 and 3. Sign the signature hash, which commits to every field above.
