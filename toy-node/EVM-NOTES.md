@@ -110,12 +110,27 @@ snapshots and state this as a known limitation of a teaching chain.
   `BreejaDb::from_state` copies state out so the lock can be released before
   executing, the same pattern as the miner's `accounts_snapshot()`.
 
-**Tests:** 60 pass (was 48): +3 in primitives (code is content-addressed, storage
-history, storage is outside the four-field encoding) and +9 in `evm.rs`
+**Tests:** 61 pass (was 48): +3 in primitives (code is content-addressed, storage
+history, storage is outside the four-field encoding) and +10 in `evm.rs`
 (`basic` for a funded and an unknown account, code and storage reads, `block_hash`,
 `commit` of balance/nonce/code/storage, untouched accounts ignored, zero write
 removes a slot, selfdestruct removes the account, snapshot from state).
 Clippy: no warnings.
+
+**The end-to-end proof.** The unit tests above build REVM's change records by hand,
+so on their own they only show that `BreejaDb` follows the traits. The test
+`a_real_evm_deploys_and_calls_a_contract_through_the_database` closes that gap: a
+real REVM deploys the brief's 11-byte contract and calls it, with every read and
+write going through `BreejaDb`. It asserts that:
+
+- the deploy returns a contract address, and the runtime code (not the initcode)
+  lands in the shared code map under its hash;
+- the call writes `42` to slot 0 and emits exactly one log, and the slot is
+  committed;
+- gas matches the brief's measurements on REVM 43: **55,522 to deploy, 43,487 to
+  call**;
+- REVM itself paid the miner exactly `gas used x gas price` with nothing credited by
+  hand (this is Pitfall 1 observed directly), and total supply is unchanged.
 
 ## 5. Decisions
 

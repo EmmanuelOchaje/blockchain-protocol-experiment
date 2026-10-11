@@ -340,6 +340,133 @@ mod tests {
         assert!(!db.accounts.contains_key(&doomed));
     }
 
+    /// Runs one transaction through a real REVM against `db` and commits the result,
+    /// returning the execution result. This is the whole integration in miniature:
+    /// REVM reads through `Database` while it runs, then `DatabaseCommit` applies
+    /// what it changed.
+    fn run(
+        db: &mut BreejaDb,
+        miner: Address,
+        tx: revm::context::TxEnv,
+    ) -> revm::context_interface::result::ExecutionResult {
+        use revm::{
+            Context, ExecuteEvm, MainBuilder, MainContext,
+            context::{BlockEnv, CfgEnv},
+            primitives::hardfork::SpecId,
+        };
+
+        let block = BlockEnv {
+            number: U256::from(1u64),
+            beneficiary: miner,
+            timestamp: U256::from(1u64),
+            gas_limit: 3_141_592,
+            basefee: 0,
+            difficulty: U256::from(1u64),
+            prevrandao: Some(B256::repeat_byte(0x01)),
+            ..Default::default()
+        };
+        let cfg = CfgEnv::new_with_spec(SpecId::SHANGHAI).with_chain_id(1);
+
+        let mut evm = Context::mainnet()
+            .with_db(&mut *db)
+            .with_block(block)
+            .with_cfg(cfg)
+            .build_mainnet();
+        let outcome = evm.transact(tx).expect("transaction is valid");
+
+        let result = outcome.result;
+        let state = outcome.state;
+        // The EVM holds `&mut` on the database for as long as it lives, so it has
+        // to be dropped before anything can be committed.
+        drop(evm);
+        db.commit(state);
+        result
+    }
+
+    /// The end-to-end proof for this milestone: a real EVM deploys a contract and
+    /// calls it, and everything it reads and writes goes through `BreejaDb`.
+    ///
+    /// The contract is the 11-byte program from the project brief:
+    /// `PUSH1 42, PUSH1 0, SSTORE, PUSH1 0, PUSH1 0, LOG0, STOP`.
+    #[test]
+    fn a_real_evm_deploys_and_calls_a_contract_through_the_database() {
+        use revm::{context::TxEnv, primitives::TxKind};
+
+        let sender = Address::repeat_byte(0x11);
+        let miner = Address::repeat_byte(0x99);
+        let gas_price = 1_000_000_000u128;
+        let initcode = Bytes::from_static(&alloy::hex!(
+            "600b600c600039600b6000f3602a60005560006000a000"
+        ));
+        let runtime = Bytes::from_static(&alloy::hex!("602a60005560006000a000"));
+
+        let mut db = funded_db(sender, one_eth() * U256::from(10u64), 0);
+
+        // 1. Deploy: a Create transaction with the initcode as data.
+        let deploy = run(
+            &mut db,
+            miner,
+            TxEnv {
+                caller: sender,
+                gas_limit: 100_000,
+                gas_price,
+                kind: TxKind::Create,
+                data: initcode,
+                nonce: 0,
+                chain_id: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(deploy.is_success(), "deploy should succeed, got {deploy:?}");
+        let deploy_gas = deploy.tx_gas_used();
+        let contract = deploy
+            .created_address()
+            .expect("a deploy returns an address");
+
+        // The runtime code (not the initcode) was committed under its hash, and the
+        // new account points at it.
+        assert_eq!(db.accounts[&contract].code_hash, keccak256(&runtime));
+        assert_eq!(db.code[&keccak256(&runtime)], runtime);
+        assert_eq!(db.accounts[&sender].nonce, 1, "the deploy used one nonce");
+
+        // 2. Call it: SSTORE writes slot 0, LOG0 emits an event.
+        let call = run(
+            &mut db,
+            miner,
+            TxEnv {
+                caller: sender,
+                gas_limit: 100_000,
+                gas_price,
+                kind: TxKind::Call(contract),
+                nonce: 1,
+                chain_id: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(call.is_success(), "call should succeed, got {call:?}");
+        let call_gas = call.tx_gas_used();
+        assert_eq!(call.logs().len(), 1, "LOG0 emitted one log");
+        assert_eq!(
+            db.accounts[&contract].storage[&U256::ZERO],
+            U256::from(42u64),
+            "SSTORE wrote 42 to slot 0, and it was committed"
+        );
+        assert_eq!(db.accounts[&sender].nonce, 2);
+
+        // The gas numbers the project brief measured on this REVM version.
+        assert_eq!(deploy_gas, 55_522, "deploy gas");
+        assert_eq!(call_gas, 43_487, "call gas");
+
+        // REVM itself paid the miner the fees: nothing here credited them by hand.
+        // This is Pitfall 1 in the project brief.
+        let fees = U256::from(deploy_gas + call_gas) * U256::from(gas_price);
+        assert_eq!(db.accounts[&miner].balance, fees);
+
+        // And no ETH was created or destroyed.
+        let supply: U256 = db.accounts.values().map(|a| a.balance).sum();
+        assert_eq!(supply, one_eth() * U256::from(10u64));
+    }
+
     #[test]
     fn a_snapshot_copies_accounts_code_and_recent_block_hashes_out_of_state() {
         let funded = Address::repeat_byte(0x11);
