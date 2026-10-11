@@ -585,6 +585,12 @@ impl BlockState {
         self.accounts.clone()
     }
 
+    /// A copy of the account state as it was after block `number`, or `None` if
+    /// that block does not exist. Used to run `eth_call` against a past block.
+    pub fn accounts_at(&self, number: u64) -> Option<HashMap<Address, Account>> {
+        self.state_history.get(number as usize).cloned()
+    }
+
     // mempool
 
     pub fn add_to_mempool(&mut self, tx: PendingTransaction) {

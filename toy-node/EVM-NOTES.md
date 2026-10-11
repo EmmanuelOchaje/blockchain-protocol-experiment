@@ -175,7 +175,36 @@ unchanged and passes.
 advanced, out-of-gas burns the whole limit, ETH conservation across contract
 execution, two pool tests, and a miner end-to-end test (deploy, call, starved call).
 
-## 7. Decisions
+## 7. Milestone 4: eth_call and eth_estimateGas
+
+**What changed:**
+
+- `executor::simulate_call` runs a call through the same REVM and `BreejaDb` as real
+  execution, then discards the changes. `transact` returns them without applying
+  them, so a call cannot leak state. A snapshot is taken under the read lock and
+  the EVM runs with no lock held, the same discipline as the miner.
+- `eth_call` returns the contract's output as hex. A revert is a JSON-RPC error
+  with code 3, message `execution reverted` and the revert data in `data`; a halt
+  is an error naming the reason. The block tag now matters: `eth_call` at an older
+  block runs against that block's state and header values (`BreejaDb::from_state_at`),
+  and a block that does not exist is an error.
+- `eth_estimateGas` finds the smallest gas limit that succeeds by binary search
+  between the intrinsic cost and the ceiling (`gas` from the request, at most the
+  block gas limit), then adds a 5% margin. A plain transfer to an account with no
+  code skips the search and returns exactly 21,000. If the call fails even with the
+  full ceiling (always reverts), the error is returned instead of a number.
+- Requests with no `to` are simulated as a deployment.
+- `revm` is built with its `optional_balance_check` feature, which is what makes the
+  balance check switchable.
+
+**Tests:** 72 pass (was 70): contract call from an address with no ETH, storage
+write discarded, revert as code-3 error, call at a past block (contract does not
+exist yet), nonexistent block refused, estimates for transfer / call / deployment /
+always-reverting / gas ceiling below intrinsic, and a test that the estimate equals
+the true threshold plus the margin and that repeated simulations leave the state
+untouched.
+
+## 8. Decisions
 
 - [x] **Code representation: `code_hash` plus a shared map**, not `Bytecode` on each
       account. Identical contracts are stored once; it matches what REVM's
@@ -191,14 +220,22 @@ execution, two pool tests, and a miner end-to-end test (deploy, call, starved ca
 - [x] **A storage slot written to zero is removed**, as on Ethereum, so two states
       that differ only by a zeroed slot are identical and will hash identically once
       the state root covers storage.
-- [ ] `eth_call`: keep or disable nonce and balance checks (via `CfgEnv`).
+- [x] `eth_call`: nonce and balance checks **off**, and gas price 0. `eth_call` is a
+      question, not a payment, and read calls routinely come from addresses with no
+      ETH. Consequence to state honestly: a successful `eth_call` does not mean the
+      real transaction would be admitted or succeed. State changes before the block
+      is mined, `eth_call` ignores the mempool (admission uses the pending balance),
+      block time/number differ, and the real gas limit may be lower. Checks stay
+      enforced where money actually moves: admission and block execution.
 - [x] `SpecId`: Shanghai, and the acknowledged "Frontier consensus, Shanghai
       execution" compromise. `prevrandao` = parent hash (no `mix_hash` field).
 - [x] `basefee = 0`: Breeja has no EIP-1559 burn, so any other value would destroy
       ETH and break supply conservation.
-- [ ] Estimation safety margin for `eth_estimateGas`.
+- [x] Estimation safety margin: 5% on top of the binary-search minimum, none for a
+      plain transfer (21,000 is exact). The search assumes more gas never hurts; a
+      contract that branches on `gasleft()` can break that.
 
-## 8. What does not work / known limitations
+## 9. What does not work / known limitations
 
 (Write this honestly as you go. Honesty is graded separately and heavily.)
 
@@ -211,8 +248,9 @@ execution, two pool tests, and a miner end-to-end test (deploy, call, starved ca
   mempool, so it is retried every block (pre-existing behaviour).
 - Block filling still uses the 149-transaction cap, not gas actually used, so a
   block of heavy contract calls can exceed `BLOCK_GAS_LIMIT` in total (Milestone 6).
-- `eth_call` / `eth_estimateGas` still refuse calldata (Milestone 4); `eth_getCode`,
-  `eth_getStorageAt`, `eth_getLogs` do not exist yet (Milestone 5); `logsBloom` is
-  still all zeros.
+- `eth_getCode`, `eth_getStorageAt`, `eth_getLogs` and `eth_gasPrice` do not exist
+  yet (Milestone 5); `logsBloom` is still all zeros.
+- `eth_call` on `pending` uses the latest block's state, not the mempool. A call
+  with `gasPrice` set ignores it (price is always 0 in a simulation).
 - `state_history` still clones every account, now including its storage, on every
   block (see Q4). Code is shared, storage is not.

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use primitives::{
-    constants::{BLOCK_REWARD, CHAIN_ID},
+    constants::{BLOCK_GAS_LIMIT, BLOCK_REWARD, CHAIN_ID, TRANSFER_GAS},
     node::{
-        Account, PendingTransaction, ReceiptLog, Transaction, TransactionReceipt, hash_list_root,
+        Account, Block, PendingTransaction, ReceiptLog, Transaction, TransactionReceipt,
+        hash_list_root, intrinsic_gas,
     },
 };
 use revm::{
@@ -56,6 +57,19 @@ pub struct BlockContext {
 }
 
 impl BlockContext {
+    /// The environment a call "at" an existing block runs in: that block's own
+    /// header values.
+    pub fn from_block(block: &Block) -> Self {
+        Self {
+            number: block.number,
+            timestamp: block.timestamp,
+            parent_hash: block.parent_hash,
+            gas_limit: block.gas_limit,
+            difficulty: block.difficulty,
+            miner: block.miner,
+        }
+    }
+
     fn block_env(&self) -> BlockEnv {
         BlockEnv {
             number: alloy::primitives::U256::from(self.number),
@@ -163,6 +177,183 @@ pub fn execute_transaction(
         logs,
     })
 }
+
+/// What a read-only call asks the EVM to do.
+#[derive(Debug, Clone, Default)]
+pub struct CallSpec {
+    pub from: Address,
+    /// `None` runs `input` as init code, without storing anything.
+    pub to: Option<Address>,
+    pub value: U256,
+    pub input: Bytes,
+    pub gas: u64,
+}
+
+/// How a simulated call ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallResult {
+    Success { output: Bytes, gas_used: u64 },
+    /// The contract executed `REVERT`; `output` usually carries the reason.
+    Revert { output: Bytes, gas_used: u64 },
+    /// The EVM stopped it (out of gas, invalid opcode, ...).
+    Halt { reason: String, gas_used: u64 },
+}
+
+impl CallResult {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success { .. })
+    }
+
+    pub fn gas_used(&self) -> u64 {
+        match self {
+            Self::Success { gas_used, .. }
+            | Self::Revert { gas_used, .. }
+            | Self::Halt { gas_used, .. } => *gas_used,
+        }
+    }
+}
+
+/// Runs a call against `db` and throws every change away.
+///
+/// This is the same REVM and the same `BreejaDb` as real execution, with three
+/// differences that make it a *simulation*: the result is never committed, the gas
+/// price is zero, and the nonce and balance checks are off. That lets any address,
+/// funded or not, ask a question. It also means a successful simulation does not
+/// prove the real transaction would be admitted or mined (see EVM-NOTES.md).
+///
+/// `Err` means REVM refused to start (for example the gas limit is below the
+/// intrinsic cost), as opposed to a call that ran and failed.
+pub fn simulate_call(
+    db: &mut BreejaDb,
+    block: &BlockContext,
+    spec: &CallSpec,
+) -> Result<CallResult, anyhow::Error> {
+    let tx_env = TxEnv {
+        tx_type: 0,
+        caller: spec.from,
+        gas_limit: spec.gas,
+        gas_price: 0,
+        kind: match spec.to {
+            Some(to) => TxKind::Call(to),
+            None => TxKind::Create,
+        },
+        data: spec.input.clone(),
+        value: spec.value,
+        chain_id: Some(CHAIN_ID),
+        ..Default::default()
+    };
+    let mut cfg = CfgEnv::new_with_spec(SPEC).with_chain_id(CHAIN_ID);
+    cfg.disable_nonce_check = true;
+    cfg.disable_balance_check = true;
+
+    let mut evm = Context::mainnet()
+        .with_db(&mut *db)
+        .with_block(block.block_env())
+        .with_cfg(cfg)
+        .build_mainnet();
+
+    // `transact` returns the changes without applying them; dropping them is what
+    // makes this a read.
+    let outcome = evm
+        .transact(tx_env)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    use revm::context::result::ExecutionResult;
+    Ok(match outcome.result {
+        ExecutionResult::Success { gas, output, .. } => CallResult::Success {
+            output: output.into_data(),
+            gas_used: gas.tx_gas_used(),
+        },
+        ExecutionResult::Revert { gas, output, .. } => CallResult::Revert {
+            output,
+            gas_used: gas.tx_gas_used(),
+        },
+        ExecutionResult::Halt { reason, gas, .. } => CallResult::Halt {
+            reason: format!("{reason:?}"),
+            gas_used: gas.tx_gas_used(),
+        },
+    })
+}
+
+/// Padding added to a computed estimate, in percent. State can move between an
+/// estimate and the block that mines the transaction, so the exact minimum is a
+/// bit risky to sign with. Plain transfers are exempt: 21,000 is exact.
+pub const ESTIMATE_MARGIN_PERCENT: u64 = 5;
+
+/// Why an estimate could not be produced.
+#[derive(Debug)]
+pub enum EstimateError {
+    /// The call fails even with the maximum gas, so no limit would help.
+    Fails(CallResult),
+    /// The request cannot run at all (for example `spec.gas` is below the
+    /// intrinsic cost).
+    Invalid(anyhow::Error),
+}
+
+/// Finds the smallest gas limit with which `spec` succeeds, by binary search.
+///
+/// `spec.gas` is the ceiling. Gas needed is not simply gas *used*: refunds are
+/// subtracted from used gas, and the EVM keeps 1/64 of gas back for a call's
+/// caller, so a limit equal to gas used can still fail. Searching is the honest
+/// way to find the real threshold. It assumes "more gas never hurts", which is
+/// true for most contracts but not all (one that branches on `gasleft()` can break
+/// it), so the result is an estimate, not a proof.
+pub fn estimate_gas(
+    db: &mut BreejaDb,
+    block: &BlockContext,
+    spec: &CallSpec,
+) -> Result<u64, EstimateError> {
+    let intrinsic = intrinsic_gas(&spec.input, spec.to.is_none());
+    if spec.gas < intrinsic {
+        return Err(EstimateError::Invalid(anyhow::anyhow!(
+            "gas limit {} is below the intrinsic cost ({intrinsic})",
+            spec.gas
+        )));
+    }
+
+    // A transfer to an account with no code runs no opcodes: its cost is exactly
+    // the intrinsic cost.
+    if let Some(to) = spec.to {
+        let has_code = db
+            .accounts
+            .get(&to)
+            .is_some_and(|account| !primitives::node::is_empty_code_hash(&account.code_hash));
+        if spec.input.is_empty() && !has_code {
+            return Ok(TRANSFER_GAS);
+        }
+    }
+
+    let ceiling = simulate_call(db, block, spec).map_err(EstimateError::Invalid)?;
+    if !ceiling.is_success() {
+        return Err(EstimateError::Fails(ceiling));
+    }
+
+    let succeeds = |db: &mut BreejaDb, gas: u64| {
+        let attempt = CallSpec {
+            gas,
+            ..spec.clone()
+        };
+        matches!(simulate_call(db, block, &attempt), Ok(result) if result.is_success())
+    };
+
+    // Invariant: `low` fails, `high` succeeds.
+    let mut low = intrinsic - 1;
+    let mut high = spec.gas;
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        if succeeds(db, mid) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+
+    let padded = high + high * ESTIMATE_MARGIN_PERCENT / 100;
+    Ok(padded.min(spec.gas))
+}
+
+/// The block gas limit, as the default and the ceiling for a call's gas.
+pub const CALL_GAS_CEILING: u64 = BLOCK_GAS_LIMIT;
 
 /// Pays the miner for sealing a block.
 ///
@@ -546,5 +737,44 @@ mod tests {
         let execution = execute_block(db, &batch, &block(miner));
         let total: U256 = execution.accounts.values().map(|a| a.balance).sum();
         assert_eq!(total, start + BLOCK_REWARD);
+    }
+
+    #[test]
+    fn the_estimate_is_the_real_threshold_and_a_simulation_changes_nothing() {
+        let miner = Address::repeat_byte(0x99);
+        let execution = execute_block(
+            funded(one_eth() * U256::from(10u64)),
+            &[create(&STORE_42_INIT, 0, 1)],
+            &block(miner),
+        );
+        let mut db = BreejaDb {
+            accounts: execution.accounts,
+            code: execution.code,
+            block_hashes: Default::default(),
+        };
+        let before = db.accounts.clone();
+        let contract = DEV_ADDRESS.create(0);
+        let spec = CallSpec {
+            from: Address::repeat_byte(0x55), // has no ETH at all
+            to: Some(contract),
+            gas: 3_000_000,
+            ..Default::default()
+        };
+
+        let estimate = estimate_gas(&mut db, &block(miner), &spec).unwrap();
+        // Unpadded, the answer is the smallest limit that works.
+        let exact = (1..=estimate)
+            .rev()
+            .find(|gas| {
+                let attempt = CallSpec { gas: *gas, ..spec.clone() };
+                !matches!(simulate_call(&mut db, &block(miner), &attempt), Ok(r) if r.is_success())
+            })
+            .unwrap()
+            + 1;
+        assert!(exact >= 43_487);
+        assert_eq!(estimate, (exact + exact * ESTIMATE_MARGIN_PERCENT / 100).min(3_000_000));
+
+        // Nothing was written, no matter how many simulations ran.
+        assert_eq!(db.accounts, before);
     }
 }

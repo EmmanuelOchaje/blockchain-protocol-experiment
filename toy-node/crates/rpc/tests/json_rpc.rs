@@ -8,7 +8,7 @@ use jsonrpsee::{
 };
 use node::{
     Chain, ChainConfig, miner,
-    testing::{DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, one_eth, sign_transfer},
+    testing::{DEV_PRIVATE_KEY, DEV_PRIVATE_KEY_1, address_of, one_eth, sign_create, sign_transfer},
 };
 use primitives::node::BreejaGenesis;
 use rpc::{RPCContext, start_server};
@@ -369,7 +369,7 @@ async fn a_transfer_produces_a_transaction_and_a_receipt() {
     assert_eq!(receipt["to"], format!("{bob:#x}"));
     assert!(
         receipt["contractAddress"].is_null(),
-        "no contracts without an EVM"
+        "a plain transfer deploys nothing"
     );
     assert_eq!(receipt["logs"].as_array().unwrap().len(), 0);
     assert_eq!(receipt["blockHash"], tx["blockHash"]);
@@ -457,76 +457,158 @@ async fn eth_send_raw_transaction_rejects_what_the_node_cannot_execute() {
     );
 }
 
+/// Returns the constant 42 as a 32-byte word. Init code (12 bytes) + runtime (10).
+const RETURNS_42_INIT: [u8; 22] = alloy::hex!("600a600c600039600a6000f3602a60005260206000f3");
+/// Stores 42 in slot 0 and emits an event.
+const STORE_42_INIT: [u8; 23] = alloy::hex!("600b600c600039600b6000f3602a60005560006000a000");
+/// Always reverts, with no data.
+const REVERTS_INIT: [u8; 17] = alloy::hex!("6005600c60003960056000f360006000fd");
+
+/// Deploys `init` from the first dev account at `nonce` and returns the contract
+/// address once it is mined.
+async fn deploy(harness: &Harness, init: &[u8], nonce: u64) -> Address {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let raw = sign_create(DEV_PRIVATE_KEY, init.to_vec().into(), nonce, 200_000).unwrap();
+    let hash: String = harness
+        .client
+        .request("eth_sendRawTransaction", rpc_params![raw.to_string()])
+        .await
+        .unwrap();
+    harness
+        .wait_for("the deployment to be mined", |c| {
+            c.read().get_receipt(&hash.parse().unwrap()).is_some()
+        })
+        .await;
+    alice.create(nonce)
+}
+
 #[tokio::test]
-async fn eth_call_answers_transfers_and_refuses_anything_needing_the_evm() {
-    let harness = Harness::start(&[], false).await;
+async fn eth_call_runs_contract_code_and_changes_nothing() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100u64))], true).await;
+    let returns_42 = deploy(&harness, &RETURNS_42_INIT, 0).await;
+    let store_42 = deploy(&harness, &STORE_42_INIT, 1).await;
 
-    // A call with no calldata invokes no code, so it returns no data.
+    // Called from an address that has never held any ETH: the checks are off.
+    let nobody = Address::repeat_byte(0x77);
     let result: String = harness
         .client
         .request(
             "eth_call",
-            rpc_params![
-                serde_json::json!({"to": Address::repeat_byte(0x22), "value": "0x1"}),
-                "latest"
-            ],
+            rpc_params![serde_json::json!({"from": nobody, "to": returns_42}), "latest"],
         )
         .await
         .unwrap();
-    assert_eq!(result, "0x");
+    assert_eq!(result, format!("0x{}2a", "00".repeat(31)));
 
-    // The one-parameter form is valid too.
+    // A call that writes storage reports success, but the write is discarded.
+    let result: String = harness
+        .client
+        .request("eth_call", rpc_params![serde_json::json!({"to": store_42})])
+        .await
+        .unwrap();
+    assert_eq!(result, "0x");
+    assert_eq!(harness.chain.read().get_storage(&store_42, U256::ZERO), U256::ZERO);
+    assert_eq!(harness.chain.read().get_account(&nobody).nonce, 0);
+
+    // A plain transfer-shaped call returns no data.
     let result: String = harness
         .client
         .request(
             "eth_call",
-            rpc_params![serde_json::json!({"to": Address::repeat_byte(0x22)})],
+            rpc_params![serde_json::json!({"to": Address::repeat_byte(0x22), "value": "0x1"})],
         )
         .await
         .unwrap();
     assert_eq!(result, "0x");
+}
 
-    // Calldata would need an interpreter, so this is an honest error rather than a
-    // fabricated return value.
+#[tokio::test]
+async fn eth_call_reports_a_revert_as_an_error_and_can_read_the_past() {
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100u64))], true).await;
+    let reverts = deploy(&harness, &REVERTS_INIT, 0).await;
+
+    let result: Result<String, _> = harness
+        .client
+        .request("eth_call", rpc_params![serde_json::json!({"to": reverts})])
+        .await;
+    let error = result.expect_err("a reverting call is an error");
+    assert!(error.to_string().contains("execution reverted"), "got: {error}");
+    assert!(error.to_string().contains("3"), "code 3: {error}");
+
+    // At block 0 the contract does not exist yet, so calling it runs no code.
+    let result: String = harness
+        .client
+        .request("eth_call", rpc_params![serde_json::json!({"to": reverts}), "0x0"])
+        .await
+        .unwrap();
+    assert_eq!(result, "0x");
+
+    // A block that does not exist is an error, not a silent fallback to latest.
     let result: Result<String, _> = harness
         .client
         .request(
             "eth_call",
-            rpc_params![
-                serde_json::json!({"to": Address::repeat_byte(0x22), "data": "0x70a08231"}),
-                "latest"
-            ],
+            rpc_params![serde_json::json!({"to": reverts}), "0xffffff"],
         )
         .await;
-    let error = result.expect_err("a contract call must be refused");
-    assert!(error.to_string().contains("no EVM"), "got: {error}");
+    assert!(result.is_err());
 }
 
 #[tokio::test]
-async fn eth_estimate_gas_returns_the_intrinsic_cost_of_a_transfer() {
+async fn eth_estimate_gas_finds_the_gas_a_transaction_needs() {
     let alice = address_of(DEV_PRIVATE_KEY).unwrap();
-    let harness = Harness::start(&[(alice, one_eth() * U256::from(10u64))], false).await;
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100u64))], true).await;
+    let store_42 = deploy(&harness, &STORE_42_INIT, 0).await;
+    let reverts = deploy(&harness, &REVERTS_INIT, 1).await;
 
+    // A plain transfer is exactly the intrinsic cost: no margin.
     let estimate: String = harness
         .client
         .request(
             "eth_estimateGas",
             rpc_params![serde_json::json!({
-                "from": alice,
-                "to": Address::repeat_byte(0x22),
-                "value": "0xde0b6b3a7640000"
+                "from": alice, "to": Address::repeat_byte(0x22), "value": "0x1"
             })],
         )
         .await
         .unwrap();
-    assert_eq!(estimate, "0x5208", "21000 gas");
+    assert_eq!(estimate, "0x5208");
 
-    // Contract creation has no `to` and needs the EVM.
+    // A contract call needs at least what it uses (43,487) and gets a small margin.
+    let estimate: String = harness
+        .client
+        .request("eth_estimateGas", rpc_params![serde_json::json!({"from": alice, "to": store_42})])
+        .await
+        .unwrap();
+    let gas = from_quantity(&estimate);
+    assert!((43_487..=43_487 * 110 / 100).contains(&gas), "got {gas}");
+
+    // A deployment (no `to`) is estimated too.
+    let estimate: String = harness
+        .client
+        .request(
+            "eth_estimateGas",
+            rpc_params![serde_json::json!({"from": alice, "data": format!("0x{}", alloy::hex::encode(STORE_42_INIT))})],
+        )
+        .await
+        .unwrap();
+    assert!(from_quantity(&estimate) >= 55_522);
+
+    // A call that always reverts cannot be estimated: no gas limit would help.
+    let result: Result<String, _> = harness
+        .client
+        .request("eth_estimateGas", rpc_params![serde_json::json!({"from": alice, "to": reverts})])
+        .await;
+    assert!(result.expect_err("must fail").to_string().contains("execution reverted"));
+
+    // A gas ceiling below the intrinsic cost is refused outright.
     let result: Result<String, _> = harness
         .client
         .request(
             "eth_estimateGas",
-            rpc_params![serde_json::json!({"from": alice, "data": "0x6080604052"})],
+            rpc_params![serde_json::json!({"from": alice, "to": store_42, "gas": "0x100"})],
         )
         .await;
     assert!(result.is_err());

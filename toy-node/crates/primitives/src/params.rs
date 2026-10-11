@@ -80,19 +80,11 @@ pub struct CallRequest {
 
 impl CallRequest {
     /// The calldata this request carries, under whichever name it was sent.
-    ///
-    /// Breeja uses this to decide whether it can answer at all: calldata means
-    /// contract code, and there is no EVM to run it.
     pub fn calldata(&self) -> Bytes {
         self.data
             .clone()
             .or_else(|| self.input.clone())
             .unwrap_or_default()
-    }
-
-    /// Whether this request needs an EVM to answer.
-    pub fn needs_evm(&self) -> bool {
-        !self.calldata().is_empty() || self.to.is_none()
     }
 }
 
@@ -123,22 +115,17 @@ mod tests {
     }
 
     #[test]
-    fn a_call_needs_an_evm_when_it_carries_calldata_or_creates_a_contract() {
-        let transfer = CallRequest {
-            to: Some(Address::ZERO),
+    fn calldata_is_read_from_either_field_name() {
+        let by_data = CallRequest {
+            data: Some(Bytes::from_static(&[1])),
             ..Default::default()
         };
-        assert!(!transfer.needs_evm());
-
-        let contract_call = CallRequest {
-            to: Some(Address::ZERO),
-            data: Some(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
+        let by_input = CallRequest {
+            input: Some(Bytes::from_static(&[2])),
             ..Default::default()
         };
-        assert!(contract_call.needs_evm());
-
-        // No `to` at all is a contract deployment.
-        let deployment = CallRequest::default();
-        assert!(deployment.needs_evm());
+        assert_eq!(by_data.calldata().as_ref(), [1]);
+        assert_eq!(by_input.calldata().as_ref(), [2]);
+        assert!(CallRequest::default().calldata().is_empty());
     }
 }

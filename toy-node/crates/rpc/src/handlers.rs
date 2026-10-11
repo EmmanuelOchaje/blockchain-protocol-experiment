@@ -4,7 +4,7 @@ use jsonrpsee::{
     types::{ErrorObjectOwned, Params, error::ErrorCode},
 };
 use primitives::{
-    constants::{CHAIN_ID, GAS_PRICE, TRANSFER_GAS},
+    constants::CHAIN_ID,
     node::BlockState,
     params::{BlockTag, CallRequest},
     response::{
@@ -12,6 +12,14 @@ use primitives::{
     },
 };
 use serde_json::Value;
+
+use node::{
+    evm::BreejaDb,
+    executor::{
+        BlockContext, CALL_GAS_CEILING, CallResult, CallSpec, EstimateError, estimate_gas,
+        simulate_call,
+    },
+};
 
 use crate::RPCContext;
 
@@ -22,15 +30,6 @@ const INVALID_INPUT: i32 = -32000;
 /// Turns an internal error into a JSON-RPC error object the client can read.
 fn invalid_input(error: impl std::fmt::Display) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(INVALID_INPUT, error.to_string(), None::<()>)
-}
-
-/// Error returned when a request needs the EVM this node does not have.
-fn no_evm(detail: &str) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(
-        INVALID_INPUT,
-        format!("this node has no EVM and only processes ETH transfers: {detail}"),
-        None::<()>,
-    )
 }
 
 fn invalid_params(error: impl std::fmt::Display) -> ErrorObjectOwned {
@@ -230,66 +229,97 @@ pub fn send_raw_transaction_handler(params: Params<'_>, context: &RPCContext) ->
 }
 
 
-/// Executes a read-only call.
-///
-/// On Ethereum this runs the EVM against current state and discards the result.
-/// Breeja has no EVM, so there are only two possible answers: a call with no
-/// calldata invokes no code and returns no data (`0x`), and a call *with* calldata
-/// is refused, because answering it honestly would require the interpreter this
-/// node omits.
-pub fn call_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
-    let mut sequence = params.sequence();
-    let request: CallRequest = sequence.next()?;
-    let tag = sequence.optional_next::<BlockTag>()?;
-
-    // Validate the block tag even though the answer does not depend on state, so
-    // a caller asking about a nonexistent block gets told.
-    if let Some(tag) = tag {
-        resolve_tag(&context.chain.read(), &tag)?;
-    }
-
-    if request.needs_evm() {
-        return Err(no_evm(
-            "eth_call can only be answered for plain transfers, which return no data",
-        ));
-    }
-
-    Ok("0x".to_owned())
+/// What a caller sent, plus the snapshot and block environment to run it in.
+struct Simulation {
+    db: BreejaDb,
+    block: BlockContext,
+    spec: CallSpec,
 }
 
-/// Estimates the gas a transaction would need.
+/// Parses `(request, tag)` and takes a snapshot of the state at that block.
 ///
-/// Without an EVM there is exactly one kind of transaction to estimate, and its
-/// cost is a constant: 21,000 gas, the intrinsic cost of a transfer. Anything
-/// carrying calldata would need to be executed to be estimated, so it is refused.
-pub fn estimate_gas_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+/// The read lock is held only while copying; the EVM runs afterwards with no lock,
+/// the same discipline as the miner, so a slow call cannot freeze the node.
+fn prepare(params: Params<'_>, context: &RPCContext) -> Result<Simulation, ErrorObjectOwned> {
     let mut sequence = params.sequence();
     let request: CallRequest = sequence.next()?;
-    let tag = sequence.optional_next::<BlockTag>()?;
+    let tag = sequence.optional_next::<BlockTag>()?.unwrap_or(BlockTag::Latest);
 
-    if let Some(tag) = tag {
-        resolve_tag(&context.chain.read(), &tag)?;
+    let (db, block) = {
+        let state = context.chain.read();
+        let number = resolve_tag(&state, &tag)?;
+        let db = BreejaDb::from_state_at(&state, number)
+            .ok_or_else(|| invalid_input(format!("no state for block {number}")))?;
+        let header = state
+            .get_block(number)
+            .ok_or_else(|| invalid_input(format!("block {number} does not exist")))?;
+        (db, BlockContext::from_block(header))
+    };
+
+    // A missing gas limit defaults to the whole block; one above the block limit
+    // is clamped to it, as nodes do, rather than refused.
+    let gas = request
+        .gas
+        .map(|gas| u64::try_from(gas).unwrap_or(u64::MAX))
+        .unwrap_or(CALL_GAS_CEILING)
+        .min(CALL_GAS_CEILING);
+
+    let spec = CallSpec {
+        from: request.from.unwrap_or_default(),
+        to: request.to,
+        value: request.value.unwrap_or_default(),
+        input: request.calldata(),
+        gas,
+    };
+    Ok(Simulation { db, block, spec })
+}
+
+/// The error for a call that ran and reverted. Code 3 and the revert data in
+/// `data` are what Ethereum clients (and ethers/viem) look for.
+fn reverted(output: &Bytes) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        3,
+        "execution reverted",
+        Some(format!("0x{}", alloy::hex::encode(output))),
+    )
+}
+
+/// Executes a read-only call: the same EVM as a real transaction, against a copy
+/// of the state, with the result thrown away.
+///
+/// A revert or halt comes back as a JSON-RPC error, because to the caller the call
+/// failed; a success returns the contract's output as hex.
+pub fn call_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let Simulation {
+        mut db,
+        block,
+        spec,
+    } = prepare(params, context)?;
+
+    match simulate_call(&mut db, &block, &spec).map_err(invalid_input)? {
+        CallResult::Success { output, .. } => Ok(format!("0x{}", alloy::hex::encode(output))),
+        CallResult::Revert { output, .. } => Err(reverted(&output)),
+        CallResult::Halt { reason, .. } => Err(invalid_input(format!("execution halted: {reason}"))),
     }
+}
 
-    if request.needs_evm() {
-        return Err(no_evm(
-            "eth_estimateGas can only be answered for plain transfers, which always cost 21000 gas",
-        ));
+/// Estimates the gas a transaction would need: the smallest limit with which it
+/// succeeds, found by binary search, plus a small margin (see
+/// [`ESTIMATE_MARGIN_PERCENT`]).
+pub fn estimate_gas_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let Simulation {
+        mut db,
+        block,
+        spec,
+    } = prepare(params, context)?;
+
+    match estimate_gas(&mut db, &block, &spec) {
+        Ok(gas) => Ok(quantity(gas)),
+        Err(EstimateError::Fails(CallResult::Revert { output, .. })) => Err(reverted(&output)),
+        Err(EstimateError::Fails(CallResult::Halt { reason, .. })) => Err(invalid_input(format!(
+            "gas required exceeds allowance or execution halted: {reason}"
+        ))),
+        Err(EstimateError::Fails(CallResult::Success { .. })) => unreachable!("success is not a failure"),
+        Err(EstimateError::Invalid(error)) => Err(invalid_input(error)),
     }
-
-    // A transfer the sender cannot afford would never be mined, so estimating it
-    // is a client bug worth surfacing.
-    if let Some(from) = request.from {
-        let value = request.value.unwrap_or(U256::ZERO);
-        let fee = U256::from(TRANSFER_GAS) * U256::from(GAS_PRICE);
-        let available = context.chain.read().get_pending_balance(&from);
-        if available < value + fee {
-            return Err(invalid_input(format!(
-                "insufficient funds: {from} has {available} but the transfer needs {}",
-                value + fee
-            )));
-        }
-    }
-
-    Ok(quantity(TRANSFER_GAS))
 }

@@ -52,6 +52,23 @@ impl BreejaDb {
     }
 }
 
+impl BreejaDb {
+    /// Like [`from_state`](Self::from_state) but for the state after block `number`,
+    /// or `None` if that block does not exist. Code is shared across history, so
+    /// only the accounts differ.
+    pub fn from_state_at(state: &BlockState, number: u64) -> Option<Self> {
+        let accounts = state.accounts_at(number)?;
+        let block_hashes = (number.saturating_sub(255)..=number)
+            .filter_map(|n| state.get_block(n).map(|block| (n, block.hash)))
+            .collect();
+        Some(Self {
+            accounts,
+            code: state.code_snapshot(),
+            block_hashes,
+        })
+    }
+}
+
 impl Database for BreejaDb {
     // Reading an in-memory map cannot fail. A database backed by disk would use a
     // real error type here.
