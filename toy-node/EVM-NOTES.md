@@ -91,16 +91,63 @@ transaction arrived. Mitigations to weigh: share code through a `code_hash` to
 bytecode map, store per-block diffs instead of whole snapshots, or keep the
 snapshots and state this as a known limitation of a teaching chain.
 
-## 4. Decisions (fill in as you make them)
+## 4. Milestone 1: teaching state about code and storage
 
-- [ ] Code representation: `Bytecode` on the account, or `code_hash` plus shared map.
-- [ ] `Database::basic` for an unknown address: `None` or an empty account.
+**What changed (no behaviour change; the miner and executor are untouched):**
+
+- `Account` (primitives) gained `storage: HashMap<U256, U256>`. Its RLP encoding is
+  still exactly the four Ethereum fields (`nonce`, `balance`, `storage_root`,
+  `code_hash`), through a small `AccountRlp` helper, so state roots are unchanged.
+  Storage is carried alongside the account rather than embedded in the encoding,
+  because Ethereum commits to storage through `storage_root`. Computing
+  `storage_root` from `storage` is Milestone 6.
+- `BlockState` gained a chain-wide `code: HashMap<B256, Bytes>` keyed by
+  `keccak256(code)`, and accessors `get_code`, `get_code_by_hash`, `get_storage`,
+  `get_storage_at` (historical, using the existing per-block snapshots),
+  `code_snapshot` and `insert_code`.
+- New `crates/node/src/evm.rs` with `BreejaDb`, a snapshot of accounts, code and
+  recent block hashes, implementing REVM's `Database` and `DatabaseCommit`.
+  `BreejaDb::from_state` copies state out so the lock can be released before
+  executing, the same pattern as the miner's `accounts_snapshot()`.
+
+**Tests:** 60 pass (was 48): +3 in primitives (code is content-addressed, storage
+history, storage is outside the four-field encoding) and +9 in `evm.rs`
+(`basic` for a funded and an unknown account, code and storage reads, `block_hash`,
+`commit` of balance/nonce/code/storage, untouched accounts ignored, zero write
+removes a slot, selfdestruct removes the account, snapshot from state).
+Clippy: no warnings.
+
+## 5. Decisions
+
+- [x] **Code representation: `code_hash` plus a shared map**, not `Bytecode` on each
+      account. Identical contracts are stored once; it matches what REVM's
+      `code_by_hash` expects; and history never copies code (an account's
+      `code_hash` is all a snapshot has to remember), which softens the Q4 cost.
+- [x] **`Database::basic` for an unknown address returns `None`**, not an empty
+      account. REVM treats `None` as a non-existent account, which changes gas
+      (sending value to or calling a non-existent account costs more), so
+      reporting "empty" would change gas numbers.
+- [x] **Two spellings of "no code" are both accepted.** Breeja's default
+      `code_hash` is `B256::ZERO`; the EVM uses `KECCAK256_EMPTY`. `basic` always
+      reports `KECCAK256_EMPTY`, and `is_empty_code_hash` accepts either.
+- [x] **A storage slot written to zero is removed**, as on Ethereum, so two states
+      that differ only by a zeroed slot are identical and will hash identically once
+      the state root covers storage.
 - [ ] `eth_call`: keep or disable nonce and balance checks (via `CfgEnv`).
 - [ ] `SpecId`: Shanghai, and the acknowledged "Frontier consensus, Shanghai
       execution" compromise.
 - [ ] `basefee = 0` and why (pre-EIP-1559; any other value burns ETH).
 - [ ] Estimation safety margin for `eth_estimateGas`.
 
-## 5. What does not work / known limitations
+## 6. What does not work / known limitations
 
 (Write this honestly as you go. Honesty is graded separately and heavily.)
+
+- After M1 the state root still ignores code and storage contents: `storage_root`
+  is not yet derived from `storage`, and `code_hash` is not yet populated by any
+  real transaction. Two chains differing only in contract state would currently
+  hash the same. Milestone 6 fixes this.
+- `BreejaDb` is built and tested, but nothing executes through it yet. The miner
+  still uses `apply_transfer` until Milestone 2.
+- `state_history` still clones every account, now including its storage, on every
+  block (see Q4). Code is shared, storage is not.

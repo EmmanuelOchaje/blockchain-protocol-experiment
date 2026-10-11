@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy_rlp::{Encodable, RlpEncodable};
+use alloy::primitives::{Address, B256, Bytes, KECCAK256_EMPTY, U256, keccak256};
+use alloy_rlp::{BufMut, Encodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{
@@ -9,15 +9,66 @@ use crate::constants::{
     MIN_DIFFICULTY_LEADING_ZEROS, TRANSFER_GAS,
 };
 
-/// An externally owned account: Ethereum's account record, minus everything a
-/// contract would need.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, RlpEncodable)]
+/// An account: Ethereum's four-field account record, plus the storage a contract
+/// keeps.
+///
+/// Only the four fields (`nonce`, `balance`, `storage_root`, `code_hash`) are RLP
+/// encoded, exactly as on Ethereum. `storage` is carried alongside and is *not*
+/// part of that encoding: Ethereum commits to storage through `storage_root`
+/// instead of embedding it. Until `storage_root` is computed from `storage`
+/// (Milestone 6) the state root does not see storage contents.
+///
+/// Contract *code* is not stored here. It lives once per distinct program in the
+/// chain-wide code map, and `code_hash` is the key into it. An account with no
+/// code has `code_hash` equal to `B256::ZERO` (what `Default` gives) or
+/// `KECCAK256_EMPTY`; [`is_empty_code_hash`] treats both as "no code".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     pub nonce: u64,
     pub balance: U256,
     pub storage_root: B256,
     pub code_hash: B256,
+    /// Contract storage. A slot that holds zero is absent, as on Ethereum.
+    #[serde(default)]
+    pub storage: HashMap<U256, U256>,
+}
+
+/// The four fields of an account that are RLP encoded and committed to by the
+/// state root.
+#[derive(RlpEncodable)]
+struct AccountRlp {
+    nonce: u64,
+    balance: U256,
+    storage_root: B256,
+    code_hash: B256,
+}
+
+impl Account {
+    fn rlp_fields(&self) -> AccountRlp {
+        AccountRlp {
+            nonce: self.nonce,
+            balance: self.balance,
+            storage_root: self.storage_root,
+            code_hash: self.code_hash,
+        }
+    }
+}
+
+impl Encodable for Account {
+    fn encode(&self, out: &mut dyn BufMut) {
+        self.rlp_fields().encode(out);
+    }
+
+    fn length(&self) -> usize {
+        self.rlp_fields().length()
+    }
+}
+
+/// Whether a code hash means "this account has no code": the all-zero default, or
+/// the hash of empty bytes that the EVM uses for the same thing.
+pub fn is_empty_code_hash(hash: &B256) -> bool {
+    *hash == B256::ZERO || *hash == KECCAK256_EMPTY
 }
 
 /// A sealed block.
@@ -152,6 +203,11 @@ pub struct BlockState {
     /// this from a trie; Breeja keeps whole snapshots, which is only affordable
     /// because a teaching chain has a handful of accounts.
     state_history: Vec<HashMap<Address, Account>>,
+    /// Contract code, keyed by `keccak256(code)`. Code is immutable and
+    /// content-addressed, so identical contracts share one entry and old blocks
+    /// never need their own copy: an account's `code_hash` is all history has to
+    /// remember.
+    code: HashMap<B256, Bytes>,
     /// Block number for a given block hash.
     block_index: HashMap<B256, u64>,
     transactions: HashMap<B256, Transaction>,
@@ -417,6 +473,57 @@ impl BlockState {
             .map(|snapshot| snapshot.get(address).cloned().unwrap_or_default())
     }
 
+    /// Code stored under `hash`, if the chain has ever seen it.
+    pub fn get_code_by_hash(&self, hash: &B256) -> Option<&Bytes> {
+        self.code.get(hash)
+    }
+
+    /// The code at `address` at the chain head. An account with no code, or an
+    /// address nobody has used, has empty code.
+    pub fn get_code(&self, address: &Address) -> Bytes {
+        let account = self.get_account(address);
+        if is_empty_code_hash(&account.code_hash) {
+            return Bytes::new();
+        }
+        self.code
+            .get(&account.code_hash)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// One storage slot at the chain head. A slot nobody has written reads as zero.
+    pub fn get_storage(&self, address: &Address, slot: U256) -> U256 {
+        self.accounts
+            .get(address)
+            .and_then(|account| account.storage.get(&slot).copied())
+            .unwrap_or(U256::ZERO)
+    }
+
+    /// One storage slot as it was after block `number`, or `None` if that block
+    /// does not exist.
+    pub fn get_storage_at(&self, address: &Address, slot: U256, number: u64) -> Option<U256> {
+        self.state_history.get(number as usize).map(|snapshot| {
+            snapshot
+                .get(address)
+                .and_then(|account| account.storage.get(&slot).copied())
+                .unwrap_or(U256::ZERO)
+        })
+    }
+
+    /// A copy of the chain-wide code map, so the EVM can look code up by hash
+    /// without holding the state lock.
+    pub fn code_snapshot(&self) -> HashMap<B256, Bytes> {
+        self.code.clone()
+    }
+
+    /// Records `code` in the chain-wide code map and returns its hash. Storing the
+    /// same program twice is harmless: it lands on the same key.
+    pub fn insert_code(&mut self, code: Bytes) -> B256 {
+        let hash = keccak256(&code);
+        self.code.insert(hash, code);
+        hash
+    }
+
     /// The nonce the sender's *next* transaction must carry: the mined nonce plus
     /// anything already sitting in the mempool for that sender.
     pub fn get_pending_nonce(&self, address: &Address) -> u64 {
@@ -631,5 +738,85 @@ mod tests {
         assert!(state.get_pending_balance(&sender) < one_eth * U256::from(9u64));
         assert_eq!(state.mempool_len(), 1);
         assert!(state.mempool_contains(&B256::repeat_byte(0xaa)));
+    }
+
+    #[test]
+    fn code_is_content_addressed_and_no_code_reads_as_empty() {
+        let holder = Address::repeat_byte(0x33);
+        let mut state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
+
+        // Two inserts of the same program land on one key.
+        let program = Bytes::from_static(&[0x60, 0x2a, 0x60, 0x00, 0x55, 0x00]);
+        let hash = state.insert_code(program.clone());
+        assert_eq!(hash, keccak256(&program));
+        assert_eq!(state.insert_code(program.clone()), hash);
+        assert_eq!(state.code_snapshot().len(), 1);
+        assert_eq!(state.get_code_by_hash(&hash), Some(&program));
+
+        // An address with that code hash reads the code back; one without reads empty.
+        assert!(state.get_code(&holder).is_empty());
+        state.accounts.insert(
+            holder,
+            Account {
+                code_hash: hash,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.get_code(&holder), program);
+        assert!(state.get_code(&Address::repeat_byte(0x44)).is_empty());
+
+        // Both spellings of "no code" are recognised.
+        assert!(is_empty_code_hash(&B256::ZERO));
+        assert!(is_empty_code_hash(&KECCAK256_EMPTY));
+        assert!(!is_empty_code_hash(&hash));
+    }
+
+    #[test]
+    fn storage_reads_zero_until_written_and_has_history() {
+        let contract = Address::repeat_byte(0x55);
+        let slot = U256::from(7u64);
+        let mut state = BlockState::new_with_gensis(BreejaGenesis::default(), 8);
+
+        assert_eq!(state.get_storage(&contract, slot), U256::ZERO);
+
+        // Write the slot and commit it as block 1.
+        let mut accounts = state.accounts_snapshot();
+        accounts
+            .entry(contract)
+            .or_default()
+            .storage
+            .insert(slot, U256::from(42u64));
+        let block = Block {
+            number: 1,
+            hash: B256::repeat_byte(0x01),
+            ..Default::default()
+        };
+        state.commit_block(accounts, block, vec![], vec![]);
+
+        assert_eq!(state.get_storage(&contract, slot), U256::from(42u64));
+        // History answers for each block honestly: zero before, 42 after.
+        assert_eq!(state.get_storage_at(&contract, slot, 0), Some(U256::ZERO));
+        assert_eq!(
+            state.get_storage_at(&contract, slot, 1),
+            Some(U256::from(42u64))
+        );
+        assert_eq!(state.get_storage_at(&contract, slot, 2), None);
+    }
+
+    #[test]
+    fn storage_is_not_part_of_the_four_field_account_encoding() {
+        // Ethereum commits to storage through `storage_root`, not by embedding it,
+        // so the RLP of an account is the same whatever its storage map holds.
+        let plain = Account::new(U256::from(5u64));
+        let mut with_storage = plain.clone();
+        with_storage
+            .storage
+            .insert(U256::from(1u64), U256::from(2u64));
+
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        plain.encode(&mut a);
+        with_storage.encode(&mut b);
+        assert_eq!(a, b);
+        assert_eq!(plain.length(), a.len());
     }
 }
