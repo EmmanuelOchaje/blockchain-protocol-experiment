@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     constants::{EXTRA_DATA, TRANSFER_GAS},
-    node::{Block, Transaction, TransactionReceipt},
+    node::{Block, ReceiptLog, Transaction, TransactionReceipt},
 };
 
 /// Encodes a number as an Ethereum *quantity*: minimal hex, `0x0` for zero.
@@ -48,6 +48,7 @@ pub struct BlockResponse {
     #[serde(rename = "transactionsRoot")]
     pub transaction_root: String,
     pub receipts_root: String,
+    pub logs_bloom: String,
     pub difficulty: String,
     pub total_difficulty: String,
     pub timestamp: String,
@@ -111,6 +112,22 @@ pub struct TransactionReceiptResponse {
     pub tx_type: String,
 }
 
+/// A log as `eth_getLogs` and `eth_getTransactionReceipt` return it: the event
+/// itself plus where it happened.
+pub fn log_json(receipt: &TransactionReceipt, log: &ReceiptLog) -> serde_json::Value {
+    serde_json::json!({
+        "address": data_address(&log.address),
+        "topics": log.topics.iter().map(data_hash).collect::<Vec<_>>(),
+        "data": data_bytes(&log.data),
+        "blockHash": data_hash(&receipt.block_hash),
+        "blockNumber": quantity(receipt.block_number),
+        "transactionHash": data_hash(&receipt.transaction_hash),
+        "transactionIndex": quantity(receipt.transaction_index),
+        "logIndex": quantity(log.log_index),
+        "removed": false,
+    })
+}
+
 impl BlockResponse {
     /// Converts a stored block into its JSON-RPC form.
     ///
@@ -124,6 +141,7 @@ impl BlockResponse {
             state_root: data_hash(&block.state_root),
             transaction_root: data_hash(&block.transaction_root),
             receipts_root: data_hash(&block.receipts_root),
+            logs_bloom: format!("{:#x}", block.logs_bloom),
             difficulty: quantity(block.difficulty),
             total_difficulty: quantity(block.total_difficulty),
             timestamp: quantity(block.timestamp),
@@ -174,25 +192,8 @@ impl From<&TransactionReceipt> for TransactionReceiptResponse {
             cummulative_gas_used: quantity(receipt.cummulative_gas_used),
             effective_gas_price: quantity(receipt.effective_gas_price),
             contract_address: receipt.contract_address.as_ref().map(data_address),
-            logs: receipt
-                .logs
-                .iter()
-                .map(|log| {
-                    serde_json::json!({
-                        "address": data_address(&log.address),
-                        "topics": log.topics.iter().map(data_hash).collect::<Vec<_>>(),
-                        "data": data_bytes(&log.data),
-                        "blockHash": data_hash(&receipt.block_hash),
-                        "blockNumber": quantity(receipt.block_number),
-                        "transactionHash": data_hash(&receipt.transaction_hash),
-                        "transactionIndex": quantity(receipt.transaction_index),
-                        "logIndex": quantity(log.log_index),
-                        "removed": false,
-                    })
-                })
-                .collect(),
-            // A bloom filter over no logs is 256 zero bytes.
-            logs_bloom: format!("0x{}", "00".repeat(256)),
+            logs: receipt.logs.iter().map(|log| log_json(receipt, log)).collect(),
+            logs_bloom: format!("{:#x}", receipt.logs_bloom),
             status: quantity(receipt.status),
             tx_type: "0x0".to_owned(),
         }

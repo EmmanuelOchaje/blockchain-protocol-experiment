@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
 /// Which block a state query refers to.
@@ -88,6 +88,38 @@ impl CallRequest {
     }
 }
 
+/// A JSON-RPC parameter that may be a single value or a list of them, such as the
+/// `address` of a log filter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    pub fn into_vec(self) -> Vec<T> {
+        match self {
+            Self::One(one) => vec![one],
+            Self::Many(many) => many,
+        }
+    }
+}
+
+/// The filter object `eth_getLogs` takes. Every field is optional.
+///
+/// `topics` is positional: `[A, null, [B, C]]` means "first topic is A, second is
+/// anything, third is B or C". `blockHash`, when present, replaces the block range.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogFilterRequest {
+    pub from_block: Option<BlockTag>,
+    pub to_block: Option<BlockTag>,
+    pub address: Option<OneOrMany<Address>>,
+    pub topics: Option<Vec<Option<OneOrMany<B256>>>>,
+    pub block_hash: Option<B256>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +159,28 @@ mod tests {
         assert_eq!(by_data.calldata().as_ref(), [1]);
         assert_eq!(by_input.calldata().as_ref(), [2]);
         assert!(CallRequest::default().calldata().is_empty());
+    }
+
+    #[test]
+    fn a_log_filter_accepts_single_values_lists_and_null_wildcards() {
+        let filter: LogFilterRequest = serde_json::from_value(serde_json::json!({
+            "fromBlock": "0x1",
+            "toBlock": "latest",
+            "address": ["0x2222222222222222222222222222222222222222"],
+            "topics": [
+                "0x0000000000000000000000000000000000000000000000000000000000000001",
+                null,
+                ["0x0000000000000000000000000000000000000000000000000000000000000002"]
+            ]
+        }))
+        .unwrap();
+        assert_eq!(filter.from_block, Some(BlockTag::Number(1)));
+        assert_eq!(filter.address.unwrap().into_vec().len(), 1);
+        let topics = filter.topics.unwrap();
+        assert!(topics[0].is_some() && topics[1].is_none() && topics[2].is_some());
+
+        // Everything is optional.
+        let empty: LogFilterRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.address.is_none() && empty.topics.is_none());
     }
 }

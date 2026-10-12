@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use alloy::primitives::{Address, B256, Bytes, KECCAK256_EMPTY, U256, keccak256};
+use alloy::primitives::{Address, B256, Bloom, Bytes, KECCAK256_EMPTY, U256, keccak256};
 use alloy_rlp::{BufMut, Encodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 
@@ -14,9 +14,10 @@ use crate::constants::{
 ///
 /// Only the four fields (`nonce`, `balance`, `storage_root`, `code_hash`) are RLP
 /// encoded, exactly as on Ethereum. `storage` is carried alongside and is *not*
-/// part of that encoding: Ethereum commits to storage through `storage_root`
-/// instead of embedding it. Until `storage_root` is computed from `storage`
-/// (Milestone 6) the state root does not see storage contents.
+/// embedded in that encoding: like Ethereum, the state root commits to storage
+/// through `storage_root`, which is derived from `storage` when the account is
+/// encoded (see [`storage_root_of`]). Code is committed through `code_hash`, which
+/// is the keccak256 of the code itself.
 ///
 /// Contract *code* is not stored here. It lives once per distinct program in the
 /// chain-wide code map, and `code_hash` is the key into it. An account with no
@@ -49,10 +50,70 @@ impl Account {
         AccountRlp {
             nonce: self.nonce,
             balance: self.balance,
-            storage_root: self.storage_root,
+            // The root is derived, never trusted from the field: whatever is in
+            // `storage` is what the state root commits to.
+            storage_root: if self.storage.is_empty() {
+                self.storage_root
+            } else {
+                storage_root_of(&self.storage)
+            },
             code_hash: self.code_hash,
         }
     }
+}
+
+/// Commits to a contract's storage in a single hash.
+///
+/// Ethereum uses a Merkle-Patricia trie here; Breeja hashes the slots in sorted
+/// order, like [`state_root_of`] does for accounts. It commits to the full contents
+/// but cannot produce proofs for a single slot. Empty storage has the zero root.
+pub fn storage_root_of(storage: &HashMap<U256, U256>) -> B256 {
+    if storage.is_empty() {
+        return B256::ZERO;
+    }
+    let mut slots: Vec<(&U256, &U256)> = storage.iter().collect();
+    slots.sort_by_key(|(slot, _)| **slot);
+
+    let mut buf = Vec::with_capacity(slots.len() * 64);
+    for (slot, value) in slots {
+        buf.extend_from_slice(&slot.to_be_bytes::<32>());
+        buf.extend_from_slice(&value.to_be_bytes::<32>());
+    }
+    keccak256(buf)
+}
+
+/// Sets the three bloom bits the Yellow Paper (section 4.3.1) assigns to `item`.
+///
+/// Take `keccak256(item)`; for each of the byte pairs (0,1), (2,3), (4,5) read a
+/// big-endian 16-bit number and keep its low 11 bits. That gives a bit position
+/// 0..2047 in a 2048-bit filter, counted from the *end* of the 256 bytes.
+pub fn bloom_add(bloom: &mut Bloom, item: &[u8]) {
+    let hash = keccak256(item);
+    for i in [0usize, 2, 4] {
+        let bit = (((hash[i] as usize) << 8) | hash[i + 1] as usize) & 2047;
+        bloom.0[255 - bit / 8] |= 1 << (bit % 8);
+    }
+}
+
+/// Whether all three bits for `item` are set. A `false` is certain (the item is
+/// not in the filter); a `true` is only "maybe", which is what makes it a filter.
+pub fn bloom_may_contain(bloom: &Bloom, item: &[u8]) -> bool {
+    let mut probe = Bloom::default();
+    bloom_add(&mut probe, item);
+    bloom.contains(&probe)
+}
+
+/// The bloom filter over a set of logs: every log's address and every topic.
+/// Data is not included, exactly as in Ethereum.
+pub fn bloom_of_logs(logs: &[ReceiptLog]) -> Bloom {
+    let mut bloom = Bloom::default();
+    for log in logs {
+        bloom_add(&mut bloom, log.address.as_slice());
+        for topic in &log.topics {
+            bloom_add(&mut bloom, topic.as_slice());
+        }
+    }
+    bloom
 }
 
 impl Encodable for Account {
@@ -84,6 +145,9 @@ pub struct Block {
     pub state_root: B256,
     pub transaction_root: B256,
     pub receipts_root: B256,
+    /// Bloom filter over every log in the block, so a log search can skip blocks
+    /// that cannot contain a match.
+    pub logs_bloom: Bloom,
     /// Number of leading zero bits `hash` must have for this block to be valid.
     pub difficulty: u8,
     /// Sum of every ancestor's difficulty plus this block's. The heaviest chain
@@ -115,6 +179,7 @@ pub struct BlockHeader {
     pub state_root: B256,
     pub transaction_root: B256,
     pub receipts_root: B256,
+    pub logs_bloom: Bloom,
     pub difficulty: u8,
     pub timestamp: u64,
     pub gas_limit: u64,
@@ -165,6 +230,8 @@ pub struct TransactionReceipt {
     /// Logs the transaction emitted. Empty if it reverted or halted, because a
     /// failed call's logs are rolled back with the rest of its effects.
     pub logs: Vec<ReceiptLog>,
+    /// Bloom filter over this transaction's logs.
+    pub logs_bloom: Bloom,
     /// `1` for success, `0` if the transaction ran but reverted or halted.
     pub status: u8,
 }
@@ -178,6 +245,53 @@ pub struct ReceiptLog {
     pub data: Bytes,
     /// Position among all logs in the block (not just this transaction's).
     pub log_index: u64,
+}
+
+/// What `eth_getLogs` is looking for.
+#[derive(Debug, Clone, Default)]
+pub struct LogFilter {
+    pub from_block: u64,
+    pub to_block: u64,
+    /// Empty means any address.
+    pub addresses: Vec<Address>,
+    /// One entry per topic position. `None` is a wildcard; `Some(options)` means
+    /// the log's topic at that position must be one of `options` (an empty list is
+    /// treated as a wildcard).
+    pub topics: Vec<Option<Vec<B256>>>,
+}
+
+impl LogFilter {
+    /// Whether `log` satisfies the address and topic conditions.
+    pub fn matches(&self, log: &ReceiptLog) -> bool {
+        if !self.addresses.is_empty() && !self.addresses.contains(&log.address) {
+            return false;
+        }
+        self.topics.iter().enumerate().all(|(position, wanted)| match wanted {
+            None => true,
+            Some(options) if options.is_empty() => true,
+            // A log with fewer topics than the filter has positions cannot match.
+            Some(options) => log
+                .topics
+                .get(position)
+                .is_some_and(|topic| options.contains(topic)),
+        })
+    }
+
+    /// Whether a block with this bloom could contain a match. `true` is "maybe".
+    pub fn may_match_bloom(&self, bloom: &Bloom) -> bool {
+        let address_ok = self.addresses.is_empty()
+            || self
+                .addresses
+                .iter()
+                .any(|address| bloom_may_contain(bloom, address.as_slice()));
+        address_ok
+            && self.topics.iter().all(|wanted| match wanted {
+                Some(options) if !options.is_empty() => options
+                    .iter()
+                    .any(|topic| bloom_may_contain(bloom, topic.as_slice())),
+                _ => true,
+            })
+    }
 }
 
 /// A transaction that has been accepted into the mempool but not yet mined.
@@ -308,6 +422,7 @@ impl Block {
             state_root: self.state_root,
             transaction_root: self.transaction_root,
             receipts_root: self.receipts_root,
+            logs_bloom: self.logs_bloom,
             difficulty: self.difficulty,
             timestamp: self.timestamp,
             gas_limit: self.gas_limit,
@@ -425,6 +540,7 @@ impl BlockState {
             state_root: state_root_of(&state.accounts),
             transaction_root: B256::ZERO,
             receipts_root: B256::ZERO,
+            logs_bloom: Bloom::default(),
             difficulty,
             timestamp: 0,
             gas_limit: BLOCK_GAS_LIMIT,
@@ -442,6 +558,7 @@ impl BlockState {
             state_root: header.state_root,
             transaction_root: header.transaction_root,
             receipts_root: header.receipts_root,
+            logs_bloom: header.logs_bloom,
             difficulty: header.difficulty,
             timestamp: header.timestamp,
             gas_limit: header.gas_limit,
@@ -518,6 +635,46 @@ impl BlockState {
             .get(&account.code_hash)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The code at `address` as it was after block `number`, or `None` if that
+    /// block does not exist.
+    pub fn get_code_at(&self, address: &Address, number: u64) -> Option<Bytes> {
+        let account = self.get_account_at(address, number)?;
+        if is_empty_code_hash(&account.code_hash) {
+            return Some(Bytes::new());
+        }
+        Some(self.code.get(&account.code_hash).cloned().unwrap_or_default())
+    }
+
+    /// Logs in blocks `filter.from_block..=filter.to_block` that match the filter,
+    /// oldest first, each with the receipt it came from.
+    pub fn get_logs(&self, filter: &LogFilter) -> Vec<(&TransactionReceipt, &ReceiptLog)> {
+        let last = filter.to_block.min(self.get_block_number());
+        let mut found = Vec::new();
+        for number in filter.from_block..=last {
+            let Some(block) = self.get_block(number) else {
+                continue;
+            };
+            // Cheap rejection first: a block whose bloom lacks the address or a
+            // required topic cannot hold a match.
+            if !filter.may_match_bloom(&block.logs_bloom) {
+                continue;
+            }
+            for hash in &block.transactions {
+                let Some(receipt) = self.receipts.get(hash) else {
+                    continue;
+                };
+                found.extend(
+                    receipt
+                        .logs
+                        .iter()
+                        .filter(|log| filter.matches(log))
+                        .map(|log| (receipt, log)),
+                );
+            }
+        }
+        found
     }
 
     /// One storage slot at the chain head. A slot nobody has written reads as zero.
@@ -607,14 +764,26 @@ impl BlockState {
         self.mempool.iter().any(|tx| &tx.hash == hash)
     }
 
-    /// The transactions the next block would include: as many as fit in one
-    /// block's gas limit, oldest first.
+    /// The transactions the next block would include: oldest first, as many as fit
+    /// in one block's gas limit.
+    ///
+    /// Each transaction is counted at its *gas limit*, because that is all that is
+    /// known before it runs. Selection stops at the first transaction that does not
+    /// fit rather than skipping it: skipping would let a later transaction from the
+    /// same sender run first and fail on its nonce.
     ///
     /// This does not remove them. The miner may spend a long time failing to seal
     /// a block, and a transaction must stay pending until it is actually mined.
     pub fn peek_mempool_batch(&self) -> Vec<PendingTransaction> {
-        let max_txs = (BLOCK_GAS_LIMIT / TRANSFER_GAS) as usize;
-        self.mempool.iter().take(max_txs).cloned().collect()
+        let mut gas = 0u64;
+        self.mempool
+            .iter()
+            .take_while(|tx| {
+                gas = gas.saturating_add(tx.gas);
+                gas <= BLOCK_GAS_LIMIT
+            })
+            .cloned()
+            .collect()
     }
 
     // block production
@@ -843,19 +1012,150 @@ mod tests {
     }
 
     #[test]
-    fn storage_is_not_part_of_the_four_field_account_encoding() {
-        // Ethereum commits to storage through `storage_root`, not by embedding it,
-        // so the RLP of an account is the same whatever its storage map holds.
+    fn storage_is_committed_through_a_derived_storage_root() {
         let plain = Account::new(U256::from(5u64));
-        let mut with_storage = plain.clone();
-        with_storage
-            .storage
-            .insert(U256::from(1u64), U256::from(2u64));
+        let mut one = plain.clone();
+        one.storage.insert(U256::from(1u64), U256::from(2u64));
+        let mut other = plain.clone();
+        other.storage.insert(U256::from(1u64), U256::from(3u64));
 
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        plain.encode(&mut a);
-        with_storage.encode(&mut b);
-        assert_eq!(a, b);
-        assert_eq!(plain.length(), a.len());
+        let encode = |a: &Account| {
+            let mut buf = Vec::new();
+            a.encode(&mut buf);
+            buf
+        };
+        // Still four RLP fields, whatever the storage holds...
+        assert_eq!(plain.length(), encode(&plain).len());
+        // ...but different storage means a different encoding, hence state root.
+        assert_ne!(encode(&plain), encode(&one));
+        assert_ne!(encode(&one), encode(&other));
+        // Insertion order is irrelevant.
+        let mut ab = plain.clone();
+        ab.storage.insert(U256::from(1u64), U256::from(1u64));
+        ab.storage.insert(U256::from(2u64), U256::from(2u64));
+        let mut ba = plain.clone();
+        ba.storage.insert(U256::from(2u64), U256::from(2u64));
+        ba.storage.insert(U256::from(1u64), U256::from(1u64));
+        assert_eq!(encode(&ab), encode(&ba));
+    }
+
+    #[test]
+    fn two_states_differing_in_one_storage_slot_have_different_state_roots() {
+        let contract = Address::repeat_byte(0x44);
+        let mut a = HashMap::new();
+        a.insert(contract, Account::new(U256::from(1u64)));
+        let mut b = a.clone();
+        b.get_mut(&contract)
+            .unwrap()
+            .storage
+            .insert(U256::ZERO, U256::from(42u64));
+        assert_ne!(state_root_of(&a), state_root_of(&b));
+
+        let mut c = b.clone();
+        c.get_mut(&contract)
+            .unwrap()
+            .storage
+            .insert(U256::ZERO, U256::from(43u64));
+        assert_ne!(state_root_of(&b), state_root_of(&c));
+    }
+
+    #[test]
+    fn two_states_differing_only_in_code_have_different_state_roots() {
+        let contract = Address::repeat_byte(0x44);
+        let mut a = HashMap::new();
+        a.insert(contract, Account::new(U256::from(1u64)));
+        let mut b = a.clone();
+        b.get_mut(&contract).unwrap().code_hash = keccak256([0x00u8]);
+        assert_ne!(state_root_of(&a), state_root_of(&b));
+    }
+
+    fn log(address: u8, topics: &[u8]) -> ReceiptLog {
+        ReceiptLog {
+            address: Address::repeat_byte(address),
+            topics: topics.iter().map(|t| B256::repeat_byte(*t)).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn our_bloom_matches_alloys_reference_implementation() {
+        let logs = [log(1, &[10, 11]), log(2, &[12])];
+        let mine = bloom_of_logs(&logs);
+
+        let mut reference = Bloom::default();
+        for l in &logs {
+            reference.accrue(alloy::primitives::BloomInput::Raw(l.address.as_slice()));
+            for t in &l.topics {
+                reference.accrue(alloy::primitives::BloomInput::Raw(t.as_slice()));
+            }
+        }
+        assert_eq!(mine, reference);
+        assert_ne!(mine, Bloom::default());
+        assert_eq!(bloom_of_logs(&[]), Bloom::default());
+    }
+
+    #[test]
+    fn a_bloom_has_no_false_negatives() {
+        let logs = [log(1, &[10, 11]), log(2, &[12])];
+        let bloom = bloom_of_logs(&logs);
+        for l in &logs {
+            assert!(bloom_may_contain(&bloom, l.address.as_slice()));
+            for t in &l.topics {
+                assert!(bloom_may_contain(&bloom, t.as_slice()));
+            }
+        }
+    }
+
+    #[test]
+    fn log_filters_match_by_address_and_by_positional_topics_with_wildcards() {
+        let l = log(7, &[1, 2]);
+        let topic = |b: u8| B256::repeat_byte(b);
+        let filter = |addresses: Vec<Address>, topics: Vec<Option<Vec<B256>>>| LogFilter {
+            to_block: 9,
+            addresses,
+            topics,
+            ..Default::default()
+        };
+
+        assert!(filter(vec![], vec![]).matches(&l));
+        assert!(filter(vec![Address::repeat_byte(7)], vec![]).matches(&l));
+        assert!(!filter(vec![Address::repeat_byte(8)], vec![]).matches(&l));
+        // Position 0 must be topic 1; position 1 is a wildcard.
+        assert!(filter(vec![], vec![Some(vec![topic(1)]), None]).matches(&l));
+        // Position 1 must be topic 2, position 0 is a wildcard.
+        assert!(filter(vec![], vec![None, Some(vec![topic(2)])]).matches(&l));
+        // OR within a position.
+        assert!(filter(vec![], vec![Some(vec![topic(9), topic(1)])]).matches(&l));
+        assert!(!filter(vec![], vec![Some(vec![topic(9)])]).matches(&l));
+        // More positions than the log has topics cannot match.
+        assert!(!filter(vec![], vec![None, None, Some(vec![topic(1)])]).matches(&l));
+    }
+
+    #[test]
+    fn a_block_is_filled_by_gas_and_stops_at_the_first_transaction_that_does_not_fit() {
+        let mut state = BlockState::new_with_gensis(BreejaGenesis::default(), 1);
+        let tx = |nonce: u64, gas: u64| PendingTransaction {
+            hash: B256::repeat_byte(nonce as u8 + 1),
+            from: Address::repeat_byte(1),
+            to: Some(Address::repeat_byte(2)),
+            input: Bytes::new(),
+            value: U256::ZERO,
+            nonce,
+            gas,
+            gas_price: 1,
+            chain_id: 1,
+            v: 0,
+            r: U256::ZERO,
+            s: U256::ZERO,
+        };
+        // 1.5M + 1.5M fits (3.0M <= 3,141,592); the third would push past the limit.
+        state.add_to_mempool(tx(0, 1_500_000));
+        state.add_to_mempool(tx(1, 1_500_000));
+        state.add_to_mempool(tx(2, 500_000));
+        state.add_to_mempool(tx(3, 21_000));
+        let batch = state.peek_mempool_batch();
+        assert_eq!(batch.len(), 2, "stops at the first that does not fit");
+        let total: u64 = batch.iter().map(|t| t.gas).sum();
+        assert!(total <= BLOCK_GAS_LIMIT);
     }
 }

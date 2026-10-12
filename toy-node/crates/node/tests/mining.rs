@@ -357,3 +357,43 @@ fn a_contract_can_be_deployed_called_and_failed_calls_are_still_mined() {
     assert_eq!(failed.gas_used, 21_500);
     assert_eq!(state.get_account(&alice).nonce, 3);
 }
+
+#[test]
+fn blocks_are_filled_by_gas_and_never_exceed_the_block_gas_limit() {
+    use primitives::constants::BLOCK_GAS_LIMIT;
+
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let bob = address_of(DEV_PRIVATE_KEY_1).unwrap();
+    let chain = test_chain(&[(alice, one_eth() * U256::from(100u64))]);
+
+    // Thirty valid transfers, each reserving a 500,000 gas limit. The old fixed rule
+    // (149 transactions per block) would have put all thirty in one block, reserving
+    // 15M gas against a 3.14M limit. Filling by gas allows six per block.
+    let mut hashes = Vec::new();
+    for nonce in 0..30 {
+        let raw =
+            sign_transfer_with(DEV_PRIVATE_KEY, bob, U256::from(1u64), nonce, GAS_PRICE, 500_000).unwrap();
+        hashes.push(chain.submit_raw_transaction(&raw).unwrap());
+    }
+
+    let handle = miner::spawn(chain.clone());
+    wait_for(Duration::from_secs(30), "all transfers to be mined", || {
+        chain.read().get_receipt(hashes.last().unwrap()).is_some()
+    });
+    chain.shutdown();
+    handle.join().unwrap();
+
+    let state = chain.read();
+    let mut mined = 0;
+    for number in 1..=state.get_block_number() {
+        let block = state.get_block(number).unwrap();
+        assert!(block.gas_used <= block.gas_limit, "block {number} overfull");
+        assert!(
+            block.transactions.len() as u64 * 500_000 <= BLOCK_GAS_LIMIT,
+            "block {number} holds more than its gas limit allows"
+        );
+        mined += block.transactions.len();
+    }
+    assert_eq!(mined, 30);
+    assert!(state.get_block_number() >= 5, "thirty transfers need several blocks");
+}

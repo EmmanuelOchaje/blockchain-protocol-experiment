@@ -4,11 +4,12 @@ use jsonrpsee::{
     types::{ErrorObjectOwned, Params, error::ErrorCode},
 };
 use primitives::{
-    constants::CHAIN_ID,
-    node::BlockState,
-    params::{BlockTag, CallRequest},
+    constants::{CHAIN_ID, GAS_PRICE},
+    node::{BlockState, LogFilter},
+    params::{BlockTag, CallRequest, LogFilterRequest},
     response::{
-        BlockResponse, TransactionReceiptResponse, TransactionResponse, data_hash, quantity,
+        BlockResponse, TransactionReceiptResponse, TransactionResponse, data_bytes, data_hash,
+        log_json, quantity,
     },
 };
 use serde_json::Value;
@@ -322,4 +323,98 @@ pub fn estimate_gas_handler(params: Params<'_>, context: &RPCContext) -> RpcResu
         Err(EstimateError::Fails(CallResult::Success { .. })) => unreachable!("success is not a failure"),
         Err(EstimateError::Invalid(error)) => Err(invalid_input(error)),
     }
+}
+
+/// The code at an address: the deployed runtime bytecode, or `0x` if there is none.
+pub fn get_code_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+    let tag = sequence
+        .optional_next::<BlockTag>()?
+        .unwrap_or(BlockTag::Latest);
+
+    let state = context.chain.read();
+    let number = resolve_tag(&state, &tag)?;
+    let code = state
+        .get_code_at(&address, number)
+        .ok_or_else(|| invalid_input(format!("block {number} does not exist")))?;
+    Ok(data_bytes(&code))
+}
+
+/// One storage slot of a contract, as a full 32-byte word (not a minimal
+/// quantity: storage is raw data, so `42` is `0x00...2a`).
+pub fn get_storage_at_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<String> {
+    let mut sequence = params.sequence();
+    let address: Address = sequence.next()?;
+    let slot: U256 = sequence.next()?;
+    let tag = sequence
+        .optional_next::<BlockTag>()?
+        .unwrap_or(BlockTag::Latest);
+
+    let state = context.chain.read();
+    let number = resolve_tag(&state, &tag)?;
+    let value = state
+        .get_storage_at(&address, slot, number)
+        .ok_or_else(|| invalid_input(format!("block {number} does not exist")))?;
+    Ok(format!("0x{}", alloy::hex::encode(value.to_be_bytes::<32>())))
+}
+
+/// The most blocks one `eth_getLogs` request may scan, so a careless
+/// `fromBlock: 0` against a long chain cannot pin the server.
+const MAX_LOG_BLOCK_RANGE: u64 = 10_000;
+
+/// Logs matching a filter: a block range (or one `blockHash`), optional addresses,
+/// and positional topics where `null` is a wildcard.
+pub fn get_logs_handler(params: Params<'_>, context: &RPCContext) -> RpcResult<Vec<Value>> {
+    let mut sequence = params.sequence();
+    let request: LogFilterRequest = sequence.next()?;
+
+    let state = context.chain.read();
+    let (from_block, to_block) = match request.block_hash {
+        Some(hash) => {
+            let block = state
+                .get_block_by_hash(&hash)
+                .ok_or_else(|| invalid_input(format!("unknown block {hash}")))?;
+            (block.number, block.number)
+        }
+        None => {
+            let from = resolve_tag(&state, &request.from_block.unwrap_or(BlockTag::Latest))?;
+            let to = resolve_tag(&state, &request.to_block.unwrap_or(BlockTag::Latest))?;
+            (from, to)
+        }
+    };
+    if from_block > to_block {
+        return Err(invalid_input(format!(
+            "fromBlock {from_block} is after toBlock {to_block}"
+        )));
+    }
+    if to_block - from_block > MAX_LOG_BLOCK_RANGE {
+        return Err(invalid_input(format!(
+            "block range too large: at most {MAX_LOG_BLOCK_RANGE} blocks per request"
+        )));
+    }
+
+    let filter = LogFilter {
+        from_block,
+        to_block,
+        addresses: request.address.map(|a| a.into_vec()).unwrap_or_default(),
+        topics: request
+            .topics
+            .unwrap_or_default()
+            .into_iter()
+            .map(|position| position.map(|options| options.into_vec()))
+            .collect(),
+    };
+
+    Ok(state
+        .get_logs(&filter)
+        .into_iter()
+        .map(|(receipt, log)| log_json(receipt, log))
+        .collect())
+}
+
+/// The gas price. Breeja has one fixed price, so this is a constant: a wallet that
+/// asks for a price to sign with gets the only one that will be accepted.
+pub fn gas_price_handler() -> String {
+    quantity(GAS_PRICE)
 }

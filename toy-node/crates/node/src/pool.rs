@@ -3,7 +3,7 @@ use alloy::consensus::{Transaction as TxTrait, TxEnvelope, TxType};
 use alloy::eips::Decodable2718;
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use primitives::{
-    constants::{CHAIN_ID, GAS_PRICE},
+    constants::{BLOCK_GAS_LIMIT, CHAIN_ID, GAS_PRICE},
     node::{BlockState, PendingTransaction, intrinsic_gas},
 };
 
@@ -85,6 +85,12 @@ fn decode_and_check(raw: &Bytes) -> Result<DecodedTransaction, anyhow::Error> {
     let intrinsic = intrinsic_gas(&input, to.is_none());
     if gas < intrinsic {
         anyhow::bail!("gas limit {gas} is below the intrinsic cost of this transaction ({intrinsic})");
+    }
+
+    // A transaction whose limit exceeds a whole block could never be included, and
+    // since blocks take transactions in order it would block everything behind it.
+    if gas > BLOCK_GAS_LIMIT {
+        anyhow::bail!("gas limit {gas} is above the block gas limit ({BLOCK_GAS_LIMIT})");
     }
 
     let gas_price = envelope.max_fee_per_gas();
@@ -221,5 +227,16 @@ mod tests {
         // Nor does it cover a creation's extra 32,000.
         let create = sign_create(DEV_PRIVATE_KEY, vec![0].into(), 0, 40_000).unwrap();
         assert!(decode_and_check(&create).is_err());
+    }
+
+    #[test]
+    fn a_gas_limit_above_the_block_gas_limit_is_rejected() {
+        use crate::testing::{DEV_PRIVATE_KEY, sign_call};
+        // It could never be included, and would block every transaction behind it.
+        let huge = sign_call(DEV_PRIVATE_KEY, Address::ZERO, Default::default(), 0, BLOCK_GAS_LIMIT + 1).unwrap();
+        let error = decode_and_check(&huge).err().expect("must be rejected");
+        assert!(error.to_string().contains("block gas limit"), "got: {error}");
+        let at_limit = sign_call(DEV_PRIVATE_KEY, Address::ZERO, Default::default(), 0, BLOCK_GAS_LIMIT).unwrap();
+        assert!(decode_and_check(&at_limit).is_ok());
     }
 }

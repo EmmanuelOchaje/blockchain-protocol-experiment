@@ -204,7 +204,87 @@ always-reverting / gas ceiling below intrinsic, and a test that the estimate equ
 the true threshold plus the margin and that repeated simulations leave the state
 untouched.
 
-## 8. Decisions
+## 8. Milestone 5: the RPC methods contracts need
+
+- `eth_getCode(address, block)`: the runtime code (not the init code) at any block,
+  `0x` for an account without code or an address nobody used. Historical, because
+  an account's `code_hash` is in every state snapshot and code itself is shared.
+- `eth_getStorageAt(address, slot, block)`: always a full 32-byte word, so 42 is
+  `0x00..2a`, not the minimal quantity `0x2a`. Storage is raw data, not a number.
+- `eth_getLogs`: block range or a single `blockHash`; `address` as one value or a
+  list; `topics` positional with `null` wildcards and OR lists. A log with fewer
+  topics than the filter has positions does not match. The scan skips blocks whose
+  `logsBloom` cannot match (that is what the bloom is for), and a request is capped
+  at 10,000 blocks so `fromBlock: 0` on a long chain cannot pin the server.
+- `eth_gasPrice`: the one fixed price, 1 gwei. This is what lets `cast send` work
+  without `--gas-price` (see README; I could not run `cast` here, see below).
+
+## 9. Milestone 6: making it hold together
+
+1. **Block gas limit.** `peek_mempool_batch` now accumulates each transaction's
+   gas limit and stops at the first one that would overflow `BLOCK_GAS_LIMIT`; the
+   149-transaction rule is gone. It *stops* rather than skipping, because skipping
+   would let a later transaction from the same sender run first and fail on its
+   nonce. Admission rejects a gas limit above the block limit, since such a
+   transaction could never be included and would block everything behind it.
+   `execute_block` also refuses to start a transaction that does not fit in the
+   gas actually remaining, as a last line of defence.
+2. **Intrinsic gas at admission:** done in M3 (21,000 + calldata + 32,000 per
+   creation + 2 per init-code word, and an init-code size cap).
+3. **`logsBloom`.** Implemented by hand from the Yellow Paper (`bloom_add`):
+   keccak the item, take three 11-bit values from byte pairs (0,1), (2,3), (4,5),
+   set those bits counting from the end of 256 bytes. A test checks it against
+   alloy's reference implementation. Receipts carry the bloom of their logs; blocks
+   carry the union, and the field is part of the block header, so it is committed to
+   by the block hash. The bloom covers addresses and topics, not data.
+4. **State root.** `storage_root` is now derived from the account's storage when the
+   account is encoded: slots sorted, each `slot||value` as 32-byte words, keccak256.
+   Code was already committed, because `code_hash` is the keccak256 of the code.
+   Tests show states differing in one storage slot, or only in code, hash differently.
+   This is a flat hash, not a Merkle-Patricia trie, so there are no proofs of a
+   single slot.
+
+**Tests:** 88 pass (was 72): bloom vs reference and no false negatives, log filter
+semantics, state-root sensitivity to storage and code, gas-based block fill (unit
+and a 30-transaction miner test where no block exceeds the limit), admission of an
+oversized gas limit, RPC tests for `eth_getCode`, `eth_getStorageAt`, `eth_getLogs`
+(range, address, topics, wildcards, OR, reversed range), `eth_gasPrice`, and real
+blooms on receipts and blocks.
+
+## 10. The Solidity demo and a live run
+
+`examples/Counter.sol` (storage, an event, a custom-error revert) is compiled by
+`examples/compile.js` with solc 0.8.24 for Shanghai; the output is checked in. The
+test `a_solidity_contract_can_be_deployed_called_estimated_logged_and_reverted`
+deploys it over JSON-RPC, increments it twice using the node's own `eth_estimateGas`
+as the gas limit, reads the result via `eth_call`, `eth_getStorageAt` and
+`eth_getLogs` (filtered on the event signature and the indexed sender), and sends a
+call that reverts with `TooBig()`: `eth_call` returns code 3 with the error selector,
+and the real transaction is mined with status `0x0`, charges the sender, advances
+the nonce and leaves the stored value unchanged.
+
+I also ran a release `breeja --dev` node and drove it from an independent Python
+signer (`eth-account`), not from this repo's test helpers: the deployment returned
+the standard first-deployment address for the dev account, `getCode` matched solc's
+runtime bytecode, two increments logged events with non-zero blooms and gas 44,967
+then 27,867 (the first writes a fresh slot), the estimate was 47,215, `eth_getLogs`
+returned both events, the reverting call had `status 0x0` and cost 21,502 gas, and
+the block's gas used stayed under the limit. The node log showed no warnings or errors.
+
+What I did **not** run: `cast`/Foundry is not installed here, so the `cast send`
+command in the README is untested.
+
+**Existing tests that changed (the brief asks for a justification).** Three of the
+original 48 asserted the old no-EVM behaviour, which is now deliberately wrong, so
+they were rewritten, not deleted: `eth_call_answers_transfers_and_refuses_anything_needing_the_evm`
+(now `eth_call_runs_contract_code_and_changes_nothing` and a revert/history test),
+`eth_estimate_gas_returns_the_intrinsic_cost_of_a_transfer` (now
+`eth_estimate_gas_finds_the_gas_a_transaction_needs`, which still checks 21,000 for
+a transfer), and the "unsupported method" test, which used `eth_gasPrice` as its
+example of a missing method and now uses `eth_getProof`. Two tests were also
+adjusted for the `to: Option<Address>` change. Total tests: 88.
+
+## 11. Decisions
 
 - [x] **Code representation: `code_hash` plus a shared map**, not `Bytecode` on each
       account. Identical contracts are stored once; it matches what REVM's
@@ -235,22 +315,28 @@ untouched.
       plain transfer (21,000 is exact). The search assumes more gas never hurts; a
       contract that branches on `gasleft()` can break that.
 
-## 9. What does not work / known limitations
+## 12. What does not work / known limitations
 
 (Write this honestly as you go. Honesty is graded separately and heavily.)
 
-- After M1 the state root still ignores code and storage contents: `storage_root`
-  is not yet derived from `storage`, and `code_hash` is not yet populated by any
-  real transaction. Two chains differing only in contract state would currently
-  hash the same. Milestone 6 fixes this.
-- `txs=` in the mined log is still the number *attempted*, not included.
 - An invalid transaction that `execute_block` skips is not removed from the
-  mempool, so it is retried every block (pre-existing behaviour).
-- Block filling still uses the 149-transaction cap, not gas actually used, so a
-  block of heavy contract calls can exceed `BLOCK_GAS_LIMIT` in total (Milestone 6).
-- `eth_getCode`, `eth_getStorageAt`, `eth_getLogs` and `eth_gasPrice` do not exist
-  yet (Milestone 5); `logsBloom` is still all zeros.
+  mempool, so it is retried every block (pre-existing behaviour). It cannot happen
+  to a transaction that was valid at admission unless the sender's funds or nonce
+  changed since, but it is a real defect.
+- Blocks are filled using each transaction's gas *limit*, which is conservative: a
+  block can be sealed with room left because the limits of queued transactions
+  did not fit, even though their real usage would have.
+- The state and storage roots are flat hashes, not Merkle-Patricia tries: they
+  commit to all contents but cannot prove one account or slot.
 - `eth_call` on `pending` uses the latest block's state, not the mempool. A call
   with `gasPrice` set ignores it (price is always 0 in a simulation).
-- `state_history` still clones every account, now including its storage, on every
-  block (see Q4). Code is shared, storage is not.
+- `eth_getLogs` is capped at 10,000 blocks per request, an arbitrary safety limit.
+- `eth_estimateGas` assumes more gas never makes a call fail; a contract that
+  branches on `gasleft()` can break that, and the 5% margin is a judgement call.
+- `state_history` still clones every account, including its storage, on every block
+  (Part 0 Q4). Code is shared; storage is not. Memory grows with blocks times state.
+- The README's `cast send` example has not been run (no Foundry here); the same
+  RPC sequence was verified with a Python signer.
+- Execution runs under Shanghai rules while consensus is otherwise Frontier-like
+  (5 ETH reward, pi-million gas limit, no fee market): the deliberate compromise
+  from Pitfall 5, not a real chain.

@@ -1,4 +1,4 @@
-# Breeja — a proof-of-work Ethereum node with no EVM
+# Breeja — a proof-of-work Ethereum node, now with an EVM
 
 Breeja is a teaching implementation of an Ethereum execution node from the
 proof-of-work era, written in Rust. It mines blocks, validates signed
@@ -29,7 +29,7 @@ in a few hundred lines you can read in an afternoon.
                  │  miner loop            crates/node/miner.rs  │
                  │                                              │
                  │  1. snapshot state and mempool               │
-                 │  2. execute transfers      → executor.rs     │
+                 │  2. execute transactions (REVM) → executor.rs     │
                  │  3. hash until the nonce works → pow.rs      │
                  │  4. commit the sealed block                  │
                  │  5. retarget difficulty                      │
@@ -84,9 +84,24 @@ must never hold real funds.**
 
 ## Sending a transaction
 
-Breeja does not implement `eth_gasPrice`, so `cast send` cannot auto-fill its
-parameters. Build and sign the transaction offline with `cast mktx`, then submit
-the raw bytes.
+Breeja serves `eth_gasPrice` (a fixed 1 gwei), `eth_chainId`, `eth_estimateGas` and
+`eth_getTransactionCount`, which is everything `cast send` asks for, so it should
+work without any fee flags:
+
+```bash
+cast send --legacy --rpc-url http://localhost:8545 \
+  --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+  --value 1ether 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+```
+
+> `cast` is not installed in the environment this was built in, so that command has
+> **not been run**. What was run is the same sequence of RPC calls (`eth_gasPrice`,
+> `eth_getTransactionCount`, `eth_estimateGas`, `eth_sendRawTransaction`,
+> `eth_getTransactionReceipt`) driven by an independent Python signer
+> (`eth-account`) against a live `breeja --dev` node. `--legacy` is required:
+> Breeja predates EIP-1559 and rejects typed transactions.
+
+You can also build the raw transaction yourself and submit it:
 
 ```bash
 RAW=$(cast mktx --legacy \
@@ -98,36 +113,50 @@ curl -s -X POST http://localhost:8545 -H 'Content-Type: application/json' \
   --data "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$RAW\"],\"id\":1}"
 ```
 
-`--legacy` is required. Breeja predates EIP-1559 and rejects typed transactions,
-because there is no base fee for one to bid against.
-
-Then poll for the receipt:
+Then poll for the receipt (a `null` receipt means "not mined yet"):
 
 ```bash
 curl -s -X POST http://localhost:8545 -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["<TX_HASH>"],"id":1}'
 ```
 
-A `null` receipt means "not mined yet" — which is exactly how every Ethereum
-client waits for confirmation.
+## Deploying a Solidity contract
+
+`examples/Counter.sol` is a small contract with storage, an event, and a custom-error
+revert. `examples/compile.js` compiles it with solc 0.8.24 targeting **Shanghai**
+(the compiler emits `PUSH0`, which is why Breeja executes under Shanghai rules) and
+writes `Counter.bin` (creation code) and `Counter.runtime.bin`. The compiled output
+is checked in, so nothing needs to be installed to run the demo:
+
+```bash
+cargo test -p rpc a_solidity_contract
+```
+
+That test deploys the contract over JSON-RPC, calls it with the node's own gas
+estimate, reads it back with `eth_call` / `eth_getStorageAt` / `eth_getLogs`, and
+checks that a reverting call is mined with `status: 0x0`, charges the sender, and
+undoes its write. With `cast` installed the same steps would be
+`cast send --create`, `cast call` and `cast logs`.
 
 ## The JSON-RPC API
-
-The same eleven methods from the assignment, now backed by real state.
 
 | Method | Behaviour |
 | --- | --- |
 | `eth_chainId` | `0x1` |
+| `eth_gasPrice` | `0x3b9aca00` (1 gwei, the only accepted price) |
 | `eth_blockNumber` | Height of the chain head |
-| `eth_getBlockByNumber` | By number or tag (`latest`, `earliest`, `pending`, `safe`, `finalized`) |
+| `eth_getBlockByNumber` | By number or tag; includes a real `logsBloom` |
 | `eth_getBlockByHash` | By hash; `null` if unknown |
-| `eth_getTransactionByHash` | Mined transactions; `null` if unknown |
-| `eth_getTransactionReceipt` | Receipts for mined transactions; `null` while pending |
+| `eth_getTransactionByHash` | Mined transactions; `null` if unknown. `to` is `null` for a deployment |
+| `eth_getTransactionReceipt` | Status, gas, `contractAddress`, logs, `logsBloom`; `null` while pending |
 | `eth_getBalance` | Balance at any historical block, or `pending` |
 | `eth_getTransactionCount` | Nonce; `pending` includes queued transactions |
-| `eth_sendRawTransaction` | Validates and queues a signed transfer |
-| `eth_call` | `0x` for a plain transfer; **error** if it needs the EVM |
-| `eth_estimateGas` | `0x5208` (21000); **error** if it needs the EVM |
+| `eth_getCode` | Runtime bytecode at any block; `0x` if none |
+| `eth_getStorageAt` | One 32-byte storage slot at any block |
+| `eth_getLogs` | Range / `blockHash`, `address` (one or a list), positional `topics` with `null` wildcards and OR lists |
+| `eth_sendRawTransaction` | Validates and queues a signed legacy transaction (transfer, call or deployment) |
+| `eth_call` | Runs the EVM against a block's state and discards the result; a revert is error code 3 with the revert data |
+| `eth_estimateGas` | Binary search for the smallest gas limit that succeeds, plus 5% (exactly 21,000 for a plain transfer) |
 
 Anything else returns `-32601 Method not found`.
 

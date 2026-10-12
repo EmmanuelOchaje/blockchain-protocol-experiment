@@ -87,6 +87,7 @@ fn run(chain: Chain) {
             state_root: execution.state_root,
             transaction_root: execution.transaction_root,
             receipts_root: execution.receipts_root,
+            logs_bloom: execution.logs_bloom,
             difficulty,
             timestamp,
             gas_limit: BLOCK_GAS_LIMIT,
@@ -121,6 +122,7 @@ fn run(chain: Chain) {
             state_root: header.state_root,
             transaction_root: header.transaction_root,
             receipts_root: header.receipts_root,
+            logs_bloom: header.logs_bloom,
             difficulty,
             total_difficulty: parent.total_difficulty + difficulty as u64,
             timestamp: header.timestamp,
@@ -145,6 +147,7 @@ fn run(chain: Chain) {
         }
 
         // commit, holding the write lock for as little as possible
+        let included;
         {
             let mut state = chain.write();
             if state.head().hash != parent.hash {
@@ -153,6 +156,7 @@ fn run(chain: Chain) {
                 );
                 continue;
             }
+            included = transactions.len();
             block.transactions = transactions.iter().map(|tx| tx.hash).collect();
             state.commit_block(execution.accounts, execution.code, block, transactions, receipts);
         }
@@ -160,7 +164,7 @@ fn run(chain: Chain) {
         tracing::info!(
             number,
             hash = %seal.hash,
-            txs = batch.len(),
+            txs = included,
             difficulty,
             nonce = seal.nonce,
             attempts = seal.attempts,

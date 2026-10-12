@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bloom, Bytes, U256};
 use primitives::{
     constants::{BLOCK_GAS_LIMIT, BLOCK_REWARD, CHAIN_ID, TRANSFER_GAS},
     node::{
         Account, Block, PendingTransaction, ReceiptLog, Transaction, TransactionReceipt,
-        hash_list_root, intrinsic_gas,
+        bloom_of_logs, hash_list_root, intrinsic_gas,
     },
 };
 use revm::{
@@ -35,6 +35,8 @@ pub struct Execution {
     pub transactions: Vec<Transaction>,
     pub receipts: Vec<TransactionReceipt>,
     pub gas_used: u64,
+    /// Bloom filter over every log in the block.
+    pub logs_bloom: Bloom,
     pub transaction_root: B256,
     pub receipts_root: B256,
     pub state_root: B256,
@@ -386,14 +388,24 @@ pub fn execute_block(
     let mut receipts = Vec::new();
     let mut gas_used = 0u64;
     let mut log_count = 0u64;
+    let mut logs_bloom = Bloom::default();
 
     for tx in batch {
+        // The miner picks a batch whose gas limits fit the block, so this should
+        // never trigger; it is the last line of defence for the invariant that a
+        // block never uses more gas than its limit.
+        if tx.gas > block.gas_limit - gas_used {
+            tracing::warn!(tx = %tx.hash, "transaction does not fit in the remaining block gas");
+            break;
+        }
         match execute_transaction(&mut db, block, tx) {
             Ok(mut outcome) => {
                 for log in &mut outcome.logs {
                     log.log_index = log_count;
                     log_count += 1;
                 }
+                let receipt_bloom = bloom_of_logs(&outcome.logs);
+                logs_bloom.accrue_bloom(&receipt_bloom);
                 let index = transactions.len() as u64;
                 gas_used += outcome.gas_used;
 
@@ -429,6 +441,7 @@ pub fn execute_block(
                     effective_gas_price: tx.gas_price,
                     contract_address: outcome.contract_address,
                     logs: outcome.logs,
+                    logs_bloom: receipt_bloom,
                     status: outcome.success as u8,
                 });
             }
@@ -456,6 +469,7 @@ pub fn execute_block(
         transactions,
         receipts,
         gas_used,
+        logs_bloom,
     }
 }
 
@@ -776,5 +790,39 @@ mod tests {
 
         // Nothing was written, no matter how many simulations ran.
         assert_eq!(db.accounts, before);
+    }
+
+    #[test]
+    fn receipts_and_the_block_carry_a_bloom_that_matches_their_logs() {
+        let miner = Address::repeat_byte(0x99);
+        let contract = DEV_ADDRESS.create(0);
+        let batch = [
+            create(&STORE_42_INIT, 0, 1),
+            call(contract, 1, 100_000, 2),
+        ];
+        let execution = execute_block(funded(one_eth() * U256::from(10u64)), &batch, &block(miner));
+
+        // The deployment and a plain transfer emit nothing: empty bloom.
+        assert_eq!(execution.receipts[0].logs_bloom, Bloom::default());
+        // The call emitted one log, so its bloom is non-zero and holds the emitter.
+        let receipt = &execution.receipts[1];
+        assert_eq!(receipt.logs_bloom, primitives::node::bloom_of_logs(&receipt.logs));
+        assert_ne!(receipt.logs_bloom, Bloom::default());
+        assert!(primitives::node::bloom_may_contain(&receipt.logs_bloom, contract.as_slice()));
+        // The block's bloom is the union of its receipts'.
+        assert_eq!(execution.logs_bloom, receipt.logs_bloom);
+
+        let no_logs = execute_block(funded(one_eth()), &[transfer(U256::from(1u64), 0)], &block(miner));
+        assert_eq!(no_logs.logs_bloom, Bloom::default());
+    }
+
+    #[test]
+    fn execution_never_runs_a_transaction_that_cannot_fit_in_the_block() {
+        let miner = Address::repeat_byte(0x99);
+        let mut too_big = transfer(U256::from(1u64), 0);
+        too_big.gas = 4_000_000; // above the 3,141,592 block limit
+        let execution = execute_block(funded(one_eth() * U256::from(10u64)), &[too_big], &block(miner));
+        assert!(execution.transactions.is_empty());
+        assert!(execution.gas_used <= 3_141_592);
     }
 }
