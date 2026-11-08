@@ -1,0 +1,13 @@
+[package]
+name = "primitives"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+alloy.workspace = true
+anyhow.workspace = true
+alloy-rlp.workspace = true
+serde_json.workspace = true

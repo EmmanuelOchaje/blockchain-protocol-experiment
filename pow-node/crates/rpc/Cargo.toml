@@ -1,0 +1,20 @@
+[package]
+name = "rpc"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+jsonrpsee = { version = "0.26.0", features = ["server"] }
+serde_json.workspace = true
+primitives.workspace = true
+node.workspace = true
+alloy.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+jsonrpsee = { version = "0.26.0", features = ["server", "http-client"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+serde_json.workspace = true

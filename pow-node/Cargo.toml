@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["bin/breeja","crates/node", "crates/primitives","crates/rpc"]
+
+
+[workspace.package]
+license = "MIT"
+authors = ["Developer Uche <developeruche@gmail.com>"]
+
+
+[workspace.dependencies]
+primitives = { path = "crates/primitives" }
+serde_json = "1.0.151"
+serde = "1.0.229"
+alloy = {version = "2.4.2", features = ["full"]}
+anyhow = "1.0.104"
+alloy-rlp = { version = "0.3.16", features = ["derive"] }
+node = { path = "crates/node" }
+rpc = { path = "crates/rpc" }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
