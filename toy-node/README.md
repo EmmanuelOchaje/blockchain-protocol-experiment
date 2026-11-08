@@ -85,8 +85,8 @@ must never hold real funds.**
 ## Sending a transaction
 
 Breeja serves `eth_gasPrice` (a fixed 1 gwei), `eth_chainId`, `eth_estimateGas` and
-`eth_getTransactionCount`, which is everything `cast send` asks for, so it should
-work without any fee flags:
+`eth_getTransactionCount`, which is everything `cast send` asks for, so it works
+without any fee flags:
 
 ```bash
 cast send --legacy --rpc-url http://localhost:8545 \
@@ -94,12 +94,10 @@ cast send --legacy --rpc-url http://localhost:8545 \
   --value 1ether 0x70997970C51812dc3A010C7d01b50e0d17dc79C8
 ```
 
-> `cast` is not installed in the environment this was built in, so that command has
-> **not been run**. What was run is the same sequence of RPC calls (`eth_gasPrice`,
-> `eth_getTransactionCount`, `eth_estimateGas`, `eth_sendRawTransaction`,
-> `eth_getTransactionReceipt`) driven by an independent Python signer
-> (`eth-account`) against a live `breeja --dev` node. `--legacy` is required:
-> Breeja predates EIP-1559 and rejects typed transactions.
+`--legacy` is required: Breeja predates EIP-1559 and rejects typed transactions.
+This command has been run with cast 1.7.1 against a live `breeja --dev` node, and
+`scripts/e2e-cast.sh` runs it (and everything below) with assertions. See
+[TESTING.md](TESTING.md).
 
 You can also build the raw transaction yourself and submit it:
 
@@ -135,8 +133,41 @@ cargo test -p rpc a_solidity_contract
 That test deploys the contract over JSON-RPC, calls it with the node's own gas
 estimate, reads it back with `eth_call` / `eth_getStorageAt` / `eth_getLogs`, and
 checks that a reverting call is mined with `status: 0x0`, charges the sender, and
-undoes its write. With `cast` installed the same steps would be
-`cast send --create`, `cast call` and `cast logs`.
+undoes its write.
+
+The same steps against a running `breeja --dev` node, with `cast`:
+
+```bash
+export ETH_RPC_URL=http://localhost:8545
+PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+# Deploy; the receipt's contractAddress is the contract.
+cast send --legacy --private-key $PK --create $(cat examples/Counter.bin)
+C=<contractAddress>
+
+cast code $C                                   # the runtime bytecode
+cast estimate $C "increment()"                 # the node's gas estimate
+cast send --legacy --private-key $PK $C "increment()"
+cast call $C "count()(uint256)"                # 1
+cast storage $C 0                              # slot 0 = 1
+cast logs --from-block 0 --address $C "Incremented(address indexed,uint256)"
+
+# A revert: eth_call reports error code 3 with TooBig() (0x8aa0e18c) ...
+cast call $C "set(uint256)" 500
+# ... and sent anyway, it is mined with status 0 and the sender pays for it.
+# (cast refuses to send a call whose estimate reverts, so give a gas limit.)
+cast send --legacy --private-key $PK --gas-limit 100000 $C "set(uint256)" 500
+```
+
+## Checking everything
+
+```bash
+scripts/verify.sh
+```
+
+Builds the release binary, runs clippy with warnings as errors, runs all tests,
+and, if `cast` and `jq` are installed, runs `scripts/e2e-cast.sh` against a live
+node. [TESTING.md](TESTING.md) maps every test to the milestone it proves.
 
 ## The JSON-RPC API
 

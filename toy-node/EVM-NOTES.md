@@ -217,7 +217,7 @@ untouched.
   `logsBloom` cannot match (that is what the bloom is for), and a request is capped
   at 10,000 blocks so `fromBlock: 0` on a long chain cannot pin the server.
 - `eth_gasPrice`: the one fixed price, 1 gwei. This is what lets `cast send` work
-  without `--gas-price` (see README; I could not run `cast` here, see below).
+  without `--gas-price` (verified with cast 1.7.1, see section 10).
 
 ## 9. Milestone 6: making it hold together
 
@@ -271,8 +271,19 @@ then 27,867 (the first writes a fresh slot), the estimate was 47,215, `eth_getLo
 returned both events, the reverting call had `status 0x0` and cost 21,502 gas, and
 the block's gas used stayed under the limit. The node log showed no warnings or errors.
 
-What I did **not** run: `cast`/Foundry is not installed here, so the `cast send`
-command in the README is untested.
+**Running `cast` (Foundry 1.7.1) against a live node.** Once Foundry was installed,
+the README's `cast send` mined the transfer (status 1), but `cast` could not read
+the result: receipts used the key `cummulativeGasUsed` instead of
+`cumulativeGasUsed`, and blocks had no `sha3Uncles`, `mixHash` or `uncles`. Both
+came from the original node, before the EVM work, and the Python signer had not
+caught them because it read the JSON loosely. Both are fixed in `response.rs`, and
+`responses_parse_as_standard_alloy_rpc_types` parses every block, transaction,
+receipt and log with alloy's RPC types (the ones `cast` uses); it fails with the
+fix reverted. `scripts/e2e-cast.sh` now repeats the whole live run with `cast`
+alone and 35 assertions: transfer, deployment, `getCode`, estimate, increment,
+storage, logs, the revert through `eth_call` and mined with status 0. All pass.
+`TESTING.md` maps every test to its milestone, and `scripts/verify.sh` runs the
+build, clippy, all tests and the live run in one command.
 
 **Existing tests that changed (the brief asks for a justification).** Three of the
 original 48 asserted the old no-EVM behaviour, which is now deliberately wrong, so
@@ -282,7 +293,8 @@ they were rewritten, not deleted: `eth_call_answers_transfers_and_refuses_anythi
 `eth_estimate_gas_finds_the_gas_a_transaction_needs`, which still checks 21,000 for
 a transfer), and the "unsupported method" test, which used `eth_gasPrice` as its
 example of a missing method and now uses `eth_getProof`. Two tests were also
-adjusted for the `to: Option<Address>` change. Total tests: 88.
+adjusted for the `to: Option<Address>` change. Total tests: 88, then 89 with the
+standard-client parsing test.
 
 ## 11. Decisions
 
@@ -335,8 +347,11 @@ adjusted for the `to: Option<Address>` change. Total tests: 88.
   branches on `gasleft()` can break that, and the 5% margin is a judgement call.
 - `state_history` still clones every account, including its storage, on every block
   (Part 0 Q4). Code is shared; storage is not. Memory grows with blocks times state.
-- The README's `cast send` example has not been run (no Foundry here); the same
-  RPC sequence was verified with a Python signer.
+- `cast send` works only with `--legacy`, and sending a call whose estimate
+  reverts needs an explicit `--gas-limit` (cast refuses otherwise, by design).
+- The code is not `cargo fmt`-clean: five files were unformatted before this
+  branch, and the EVM work left five more. Formatting is not part of the brief's
+  checks, and reformatting would bury the real changes in the diff.
 - Execution runs under Shanghai rules while consensus is otherwise Frontier-like
   (5 ETH reward, pi-million gas limit, no fee market): the deliberate compromise
   from Pitfall 5, not a real chain.
