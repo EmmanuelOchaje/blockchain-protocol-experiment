@@ -752,6 +752,80 @@ async fn eth_get_logs_filters_by_range_address_and_topics() {
     assert!(result.is_err());
 }
 
+/// Standard tooling must be able to parse every object the node returns.
+///
+/// `cast` and every alloy-based client deserialize responses into alloy's RPC
+/// types, which reject a block without `sha3Uncles` and a receipt without
+/// `cumulativeGasUsed`. Running `cast send` against a live node found both: the
+/// transaction was mined, but `cast` could not read the receipt. This test parses
+/// a transfer, a deployment, a call that emits a log, their receipts and their
+/// blocks with those same types, so the incompatibility cannot come back.
+#[tokio::test]
+async fn responses_parse_as_standard_alloy_rpc_types() {
+    use alloy::rpc::types::{Block, Log, Transaction, TransactionReceipt};
+
+    let alice = address_of(DEV_PRIVATE_KEY).unwrap();
+    let bob = address_of(DEV_PRIVATE_KEY_1).unwrap();
+    let harness = Harness::start(&[(alice, one_eth() * U256::from(100u64))], true).await;
+
+    let raw = sign_transfer(DEV_PRIVATE_KEY, bob, one_eth(), 0).unwrap();
+    let transfer: String = harness
+        .client
+        .request("eth_sendRawTransaction", rpc_params![raw.to_string()])
+        .await
+        .unwrap();
+    harness
+        .wait_for("the transfer to be mined", |c| {
+            c.read().get_receipt(&transfer.parse().unwrap()).is_some()
+        })
+        .await;
+    let contract = deploy(&harness, &LOGS_WITH_TOPIC_INIT, 1).await;
+    let call = send_call(&harness, contract, 2).await;
+
+    for hash in [&transfer, &call] {
+        let tx: Value = harness
+            .client
+            .request("eth_getTransactionByHash", rpc_params![hash])
+            .await
+            .unwrap();
+        let parsed: Transaction = serde_json::from_value(tx).expect("a standard transaction");
+        assert_eq!(format!("{:#x}", parsed.inner.tx_hash()), *hash);
+
+        let receipt: Value = harness
+            .client
+            .request("eth_getTransactionReceipt", rpc_params![hash])
+            .await
+            .unwrap();
+        assert!(receipt.get("cumulativeGasUsed").is_some(), "standard spelling");
+        let parsed: TransactionReceipt =
+            serde_json::from_value(receipt.clone()).expect("a standard receipt");
+        assert!(parsed.status());
+
+        for full in [false, true] {
+            let block: Value = harness
+                .client
+                .request(
+                    "eth_getBlockByHash",
+                    rpc_params![receipt["blockHash"].as_str().unwrap(), full],
+                )
+                .await
+                .unwrap();
+            let parsed: Block = serde_json::from_value(block).expect("a standard block");
+            assert_eq!(Some(parsed.header.hash), receipt["blockHash"].as_str().map(|h| h.parse().unwrap()));
+        }
+    }
+
+    // The call's log parses too, as `eth_getLogs` returns it.
+    let logs: Value = harness
+        .client
+        .request("eth_getLogs", rpc_params![serde_json::json!({"fromBlock": "0x0", "address": contract})])
+        .await
+        .unwrap();
+    let parsed: Vec<Log> = serde_json::from_value(logs).expect("standard logs");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].address(), contract);
+}
+
 /// The block number (as hex) a mined transaction landed in.
 async fn found_block(harness: &Harness, tx_hash: &str) -> String {
     let receipt: Value = harness

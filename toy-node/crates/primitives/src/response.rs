@@ -49,6 +49,12 @@ pub struct BlockResponse {
     pub transaction_root: String,
     pub receipts_root: String,
     pub logs_bloom: String,
+    /// Hash of the uncle list. Breeja never includes uncles, so this is always
+    /// the keccak of an empty RLP list. Standard clients require the field.
+    pub sha3_uncles: String,
+    /// Proof-of-work mix digest. Breeja's proof of work has no mix digest, so it
+    /// is zero; standard clients require the field.
+    pub mix_hash: String,
     pub difficulty: String,
     pub total_difficulty: String,
     pub timestamp: String,
@@ -61,7 +67,14 @@ pub struct BlockResponse {
     /// Transaction hashes, or full transaction objects when the caller asked for
     /// them with the `fullTransactions` flag.
     pub transactions: Vec<serde_json::Value>,
+    /// Always empty: Breeja has no uncles.
+    pub uncles: Vec<String>,
 }
+
+/// keccak256 of the RLP encoding of an empty list, the `sha3Uncles` of any block
+/// without uncles.
+pub const EMPTY_UNCLES_HASH: &str =
+    "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347";
 
 /// A transaction, as `eth_getTransactionByHash` returns it.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -100,6 +113,9 @@ pub struct TransactionReceiptResponse {
     /// `null` for a contract creation.
     pub to: Option<String>,
     pub gas_used: String,
+    /// Serialized under the standard spelling. The original response used
+    /// `cummulativeGasUsed`, which standard clients (cast, alloy, ethers) reject.
+    #[serde(rename = "cumulativeGasUsed")]
     pub cummulative_gas_used: String,
     pub effective_gas_price: String,
     /// Set when the transaction deployed a contract.
@@ -142,6 +158,8 @@ impl BlockResponse {
             transaction_root: data_hash(&block.transaction_root),
             receipts_root: data_hash(&block.receipts_root),
             logs_bloom: format!("{:#x}", block.logs_bloom),
+            sha3_uncles: EMPTY_UNCLES_HASH.to_owned(),
+            mix_hash: data_hash(&B256::ZERO),
             difficulty: quantity(block.difficulty),
             total_difficulty: quantity(block.total_difficulty),
             timestamp: quantity(block.timestamp),
@@ -152,6 +170,7 @@ impl BlockResponse {
             nonce: data_u64(block.nonce),
             size: quantity(block_size(block)),
             transactions,
+            uncles: Vec::new(),
         }
     }
 }
