@@ -10,7 +10,7 @@
 # and always stops the node it started.
 #
 # Requirements: cargo, cast (Foundry), jq.
-# Usage: scripts/e2e-cast.sh            (from toy-node/)
+# Usage: scripts/e2e-cast.sh            (from pow-node/)
 #        PORT=8600 scripts/e2e-cast.sh  (use another port)
 
 set -euo pipefail

@@ -5,7 +5,7 @@ builds and works, and which test proves which part of the project.
 
 ## One command
 
-From `toy-node/`:
+From `pow-node/`:
 
 ```bash
 scripts/verify.sh

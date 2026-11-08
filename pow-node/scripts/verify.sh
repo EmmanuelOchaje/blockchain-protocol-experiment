@@ -9,7 +9,7 @@
 # Step 4 needs `cast` and `jq`. Without them it is skipped with a note, and the
 # Rust tests still cover the same behaviour through the JSON-RPC client.
 #
-# Usage: scripts/verify.sh   (from toy-node/)
+# Usage: scripts/verify.sh   (from pow-node/)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
